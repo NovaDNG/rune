@@ -1,4 +1,3 @@
-use std::env::current_exe;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -149,26 +148,7 @@ pub fn get_storage_info(lib_path: &str, db_path: Option<&str>) -> Result<Storage
 
 pub type MainDbConnection = sea_orm::DatabaseConnection;
 
-fn get_crsqlite_path() -> Result<String> {
-    let mut current_exe_path = current_exe()?;
-
-    current_exe_path.pop();
-
-    #[cfg(target_os = "linux")]
-    {
-        current_exe_path.push("lib");
-        current_exe_path.push("crsqlite");
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        current_exe_path.push("crsqlite");
-    }
-
-    Ok(current_exe_path.display().to_string())
-}
-
-pub async fn connect_main_db(lib_path: &str, db_path: Option<&str>) -> Result<MainDbConnection> {
+pub async fn connect_main_db(lib_path: &str, db_path: Option<&str>, node_id: &str) -> Result<MainDbConnection> {
     let storage_info = get_storage_info(lib_path, db_path)?;
     let db_path = storage_info.get_main_db_path();
 
@@ -181,11 +161,7 @@ pub async fn connect_main_db(lib_path: &str, db_path: Option<&str>) -> Result<Ma
         db_path.into_os_string().into_string().unwrap()
     );
 
-    let crsqlite_path = get_crsqlite_path()?;
-
-    info!("Loading cr-sqlite from: {}", crsqlite_path);
-
-    let connection_options = SqliteConnectOptions::from_str(&db_url)?.extension(crsqlite_path);
+    let connection_options = SqliteConnectOptions::from_str(&db_url)?;
 
     let pool = SqlitePool::connect_with(connection_options).await?;
 
@@ -193,14 +169,14 @@ pub async fn connect_main_db(lib_path: &str, db_path: Option<&str>) -> Result<Ma
 
     let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
 
-    initialize_db(&db).await?;
+    initialize_db(&db, node_id).await?;
 
     Ok(db)
 }
 
-pub async fn initialize_db(conn: &sea_orm::DatabaseConnection) -> Result<()> {
+pub async fn initialize_db(conn: &sea_orm::DatabaseConnection, node_id: &str) -> Result<()> {
     Migrator::up(conn, None).await?;
-    initialize_mix_queries(conn).await?;
+    initialize_mix_queries(conn, node_id).await?;
     Ok(())
 }
 
