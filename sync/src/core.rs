@@ -89,8 +89,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::chunking::{break_data_chunk, generate_data_chunks, ChunkingOptions, DataChunk};
-use crate::foreign_key::{FkPayload, ForeignKeyResolver};
+use crate::foreign_key::{
+    ActiveModelWithForeignKeyOps, FkPayload, ForeignKeyResolver, ModelWithForeignKeyOps,
+};
 use crate::hlc::{HLCModel, HLCQuery, HLCRecord, SyncTaskContext, HLC};
+use crate::utils::merge_fk_mappings;
 
 /// If a chunk pair has differing hashes, but the maximum record count
 /// in either chunk is below or equal to this threshold, fetch individual records directly
@@ -219,7 +222,7 @@ pub trait RemoteDataSource: Send + Sync + Debug {
         table_name: &str,
         start_hlc: &HLC,
         end_hlc: &HLC,
-    ) -> Result<Vec<E::Model>>
+    ) -> Result<RemoteRecordsWithPayload<E::Model>>
     where
         E: HLCModel + EntityTrait + Send + Sync,
         E::Model: HLCRecord + Send + Sync + for<'de> Deserialize<'de> + Serialize;
@@ -301,7 +304,7 @@ struct ComparisonRange {
 enum ReconciliationItem {
     /// A pair of local and remote chunks covering the exact same HLC range but with differing hashes.
     /// Needs further processing (breakdown or fetch).
-    ChunkPair(DataChunk, DataChunk), // (Local Chunk, Remote Chunk)
+    ChunkPair(Box<DataChunk>, Box<DataChunk>), // (Local Chunk, Remote Chunk)
     /// An HLC range for which individual records need to be fetched from both local and remote sources.
     FetchRange(ComparisonRange),
 }
@@ -359,9 +362,10 @@ where
         + Clone
         + Serialize // Needed for apply_remote_changes potentially
         + for<'de> Deserialize<'de> // Needed for receiving remote records potentially
-        + IntoActiveModel<E::ActiveModel>,
+        + IntoActiveModel<E::ActiveModel>
+        + ModelWithForeignKeyOps,
     // ActiveModel must support standard SeaORM behavior
-    E::ActiveModel: ActiveModelBehavior + Send + Sync + Debug,
+    E::ActiveModel: ActiveModelBehavior + Send + Sync + Debug + ActiveModelWithForeignKeyOps,
     // PrimaryKey must support trait operations and conversion from string ID
     E::PrimaryKey:
         PrimaryKeyTrait + PrimaryKeyFromStr<<E::PrimaryKey as PrimaryKeyTrait>::ValueType>,
@@ -387,10 +391,11 @@ where
     // 1. Fetch Initial Chunks
     // Fetch local and remote chunk metadata for data modified *after* the last sync HLC.
     let sync_start_hlc = metadata.last_sync_hlc.clone();
-    let local_chunks_fut = generate_data_chunks::<E>(
+    let local_chunks_fut = generate_data_chunks::<E, FKR>(
         context.db,
         &context.chunking_options,
         Some(sync_start_hlc.clone()),
+        fk_resolver,
     );
     let remote_chunks_fut = context
         .remote_source
@@ -407,6 +412,8 @@ where
     // Sort chunks by start HLC for efficient alignment
     local_chunks.sort_by(|a, b| a.start_hlc.cmp(&b.start_hlc));
     remote_chunks.sort_by(|a, b| a.start_hlc.cmp(&b.start_hlc));
+
+    let remote_fk_mappings = merge_fk_mappings(&remote_chunks);
 
     debug!(
         "Table '{}': Found {} local chunks, {} remote chunks after HLC {}",
@@ -463,12 +470,14 @@ where
                         range.start_hlc, range.end_hlc
                     )
                 })?);
-                remote_records_to_compare.extend(remote_res.with_context(|| {
+                let remote_res = remote_res.with_context(|| {
                     format!(
                         "Failed to fetch remote records for range [{}-{}]",
                         range.start_hlc, range.end_hlc
                     )
-                })?);
+                })?;
+
+                remote_records_to_compare.extend(remote_res.records);
             }
             ReconciliationItem::ChunkPair(local_chunk, remote_chunk) => {
                 // This pair represents aligned chunks with differing hashes
@@ -530,14 +539,19 @@ where
                     let sub_chunk_size = COMPARISON_THRESHOLD; // Use threshold as target size
 
                     // Break down local chunk (includes verification)
-                    let local_subs_fut =
-                        break_data_chunk::<E>(context.db, &local_chunk, sub_chunk_size);
+                    let local_subs_fut = break_data_chunk::<E, FKR>(
+                        context.db,
+                        &local_chunk,
+                        sub_chunk_size,
+                        fk_resolver,
+                    );
 
-                    // Request remote sub-chunks (remote performs its own verification)
-                    // Pass the *local* chunk definition as the basis for remote breakdown request
+                    // Request remote sub-chunks. The remote is asked to break down its own 'remote_chunk'.
+                    // The remote implementation should verify this 'remote_chunk' against its current data
+                    // for that HLC range before generating sub-chunks from its data.
                     let remote_subs_fut = context.remote_source.get_remote_sub_chunks::<E>(
                         table_name,
-                        &local_chunk,
+                        &remote_chunk, // Pass the remote_chunk from the ChunkPair
                         sub_chunk_size,
                     );
 
@@ -734,11 +748,7 @@ where
                 {
                     let fk_payload = if let Some(resolver) = &fk_resolver {
                         resolver
-                            .extract_foreign_key_sync_ids::<E::Model, _>(
-                                table_name,
-                                &local_record,
-                                context.db,
-                            )
+                            .extract_foreign_key_sync_ids(&local_record, context.db)
                             .await
                             .with_context(|| {
                                 format!(
@@ -765,7 +775,10 @@ where
                     || context.sync_direction == SyncDirection::Bidirectional
                 {
                     let fk_payload = if let Some(resolver) = &fk_resolver {
-                        resolver.extract_sync_ids_from_remote_model(table_name, &remote_record)?
+                        resolver.extract_sync_ids_from_remote_model_with_mapping(
+                            &remote_record,
+                            Some(&remote_fk_mappings),
+                        )?
                     } else {
                         FkPayload::new()
                     };
@@ -853,11 +866,7 @@ where
                         debug!(":: Action: UpdateRemote with local winner.");
                         let fk_payload = if let Some(resolver) = &fk_resolver {
                             resolver
-                                .extract_foreign_key_sync_ids::<E::Model, _>(
-                                    table_name,
-                                    &local_record,
-                                    context.db,
-                                )
+                                .extract_foreign_key_sync_ids(&local_record, context.db)
                                 .await
                                 .with_context(|| {
                                     format!(
@@ -888,8 +897,10 @@ where
                         debug!(":: Action: UpdateLocal with remote winner.");
 
                         let fk_payload = if let Some(resolver) = &fk_resolver {
-                            resolver
-                                .extract_sync_ids_from_remote_model(table_name, &remote_record)?
+                            resolver.extract_sync_ids_from_remote_model_with_mapping(
+                                &remote_record,
+                                Some(&remote_fk_mappings),
+                            )?
                         } else {
                             FkPayload::new()
                         };
@@ -1028,8 +1039,15 @@ async fn apply_local_changes<E, FKR>(
 where
     // Constraints copied from synchronize_table for consistency
     E: HLCModel + EntityTrait + Send + Sync,
-    E::Model: HLCRecord + Send + Sync + Debug + Clone + Serialize + IntoActiveModel<E::ActiveModel>,
-    E::ActiveModel: ActiveModelBehavior + Send + Sync + Debug,
+    E::Model: HLCRecord
+        + Send
+        + Sync
+        + Debug
+        + Clone
+        + Serialize
+        + IntoActiveModel<E::ActiveModel>
+        + ModelWithForeignKeyOps,
+    E::ActiveModel: ActiveModelBehavior + Send + Sync + Debug + ActiveModelWithForeignKeyOps,
     E::PrimaryKey:
         PrimaryKeyTrait + PrimaryKeyFromStr<<E::PrimaryKey as PrimaryKeyTrait>::ValueType>,
     <E::PrimaryKey as PrimaryKeyTrait>::ValueType:
@@ -1068,8 +1086,7 @@ where
 
                 if let Some(resolver) = &fk_resolver {
                     resolver
-                        .remap_and_set_foreign_keys::<E::ActiveModel, _>(
-                            E::table_name(&E::default()), // Get table name from Entity
+                        .remap_and_set_foreign_keys(
                             &mut active_model,
                             &fk_payload,
                             &txn, // Use transaction for lookups
@@ -1104,8 +1121,7 @@ where
 
                 if let Some(resolver) = &fk_resolver {
                     resolver
-                        .remap_and_set_foreign_keys::<E::ActiveModel, _>(
-                            E::table_name(&E::default()),
+                        .remap_and_set_foreign_keys(
                             &mut am_from_model, // Apply FK remapping to this AM
                             &fk_payload,
                             &txn,
@@ -1254,8 +1270,8 @@ fn align_and_queue_chunks(
                                     local.start_hlc, local.end_hlc
                                 );
                                 queue.push_back(ReconciliationItem::ChunkPair(
-                                    local.clone(),
-                                    remote.clone(),
+                                    Box::new(local.clone()),
+                                    Box::new(remote.clone()),
                                 ));
                             }
                             // Advance both indexes
@@ -1369,6 +1385,21 @@ fn update_max_hlc(current_max: &mut HLC, potentially_new: &HLC) {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct RemoteRecordsWithPayload<Model: HLCRecord> {
+    pub records: Vec<Model>,
+    pub fk_payloads: Vec<FkPayload>,
+}
+
+impl<Model: HLCRecord> Default for RemoteRecordsWithPayload<Model> {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            fk_payloads: Vec::new(),
+        }
+    }
+}
+
 // Trait for Primary Key Parsing
 
 /// Trait required for SeaORM Entities' PrimaryKey types.
@@ -1387,49 +1418,56 @@ pub(crate) mod tests {
     use std::fmt::Debug;
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use sea_orm::{
         ConnectionTrait, Database, DbBackend, DbConn, NotSet, PrimaryKeyTrait, QueryOrder, Schema,
         Set,
     };
     use serde::{Deserialize, Serialize};
-    use tokio::sync::Mutex as TokioMutex; // Use Tokio Mutex for async mocking
+    use tokio::sync::Mutex as TokioMutex;
     use uuid::Uuid;
 
     use super::*;
-    use crate::chunking::{calculate_chunk_hash, ChunkingOptions, DataChunk};
+    use crate::chunking::{calculate_chunk_hash, ChunkFkMapping, ChunkingOptions, DataChunk};
     use crate::core::PrimaryKeyFromStr;
     use crate::hlc::{hlc_timestamp_millis_to_rfc3339, HLCModel, HLCRecord, SyncTaskContext, HLC};
 
     #[derive(Debug)]
-    struct NoOpForeignKeyResolver;
+    pub(crate) struct NoOpForeignKeyResolver;
 
     #[async_trait::async_trait]
     impl ForeignKeyResolver for NoOpForeignKeyResolver {
         async fn extract_foreign_key_sync_ids<M: HLCRecord + Send + Sync, DB: ConnectionTrait>(
             &self,
-            _table_name: &str,
             _model: &M,
             _db: &DB,
         ) -> Result<FkPayload> {
             Ok(FkPayload::new())
         }
 
-        fn extract_sync_ids_from_remote_model<M: HLCRecord + Send + Sync>(
+        fn extract_sync_ids_from_remote_model_with_mapping<M: HLCRecord + Send + Sync>(
             &self,
-            _table_name: &str,
             _model: &M,
+            _fkmap: Option<&ChunkFkMapping>,
         ) -> Result<FkPayload> {
             Ok(FkPayload::new())
         }
 
         async fn remap_and_set_foreign_keys<AM: ActiveModelBehavior + Send, DB: ConnectionTrait>(
             &self,
-            _table_name: &str,
             _active_model: &mut AM,
             _fk_payload: &FkPayload,
             _db: &DB,
         ) -> Result<()> {
             Ok(())
+        }
+
+        async fn generate_fk_mappings_for_records<AM, DB: ConnectionTrait>(
+            &self,
+            _records: &[AM],
+            _db: &DB,
+        ) -> Result<ChunkFkMapping> {
+            Ok(Default::default())
         }
     }
 
@@ -1439,6 +1477,7 @@ pub(crate) mod tests {
         use std::str::FromStr;
 
         use anyhow::{anyhow, Result};
+        use async_trait::async_trait;
         use sea_orm::{
             ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter,
         };
@@ -1521,6 +1560,41 @@ pub(crate) mod tests {
             }
         }
 
+        #[async_trait]
+        impl ModelWithForeignKeyOps for Model {
+            async fn extract_model_fk_sync_ids<E: DatabaseExecutor>(
+                &self,
+                _db: &E,
+            ) -> Result<FkPayload> {
+                Ok(FkPayload::new()) // Authors don't have outgoing FKs
+            }
+
+            async fn generate_model_fk_mappings_for_batch<E: DatabaseExecutor>(
+                _records: &[Self],
+                _db: &E,
+            ) -> Result<ChunkFkMapping> {
+                Ok(ChunkFkMapping::new()) // Authors don't have FKs that need mapping for children
+            }
+
+            fn extract_model_sync_ids_from_remote(
+                &self,
+                _chunk_fk_map: &ChunkFkMapping,
+            ) -> Result<FkPayload> {
+                Ok(FkPayload::new()) // Authors are parents, not consuming FKs this way
+            }
+        }
+
+        #[async_trait]
+        impl ActiveModelWithForeignKeyOps for ActiveModel {
+            async fn remap_model_and_set_foreign_keys<E: DatabaseExecutor>(
+                &mut self,
+                _fk_sync_id_payload: &FkPayload,
+                _db: &E,
+            ) -> Result<()> {
+                Ok(()) // Authors don't have FKs to remap
+            }
+        }
+
         impl HLCModel for Entity {
             fn updated_at_time_column() -> Self::Column {
                 Column::UpdatedAtHlcTs
@@ -1530,6 +1604,9 @@ pub(crate) mod tests {
             }
             fn unique_id_column() -> Self::Column {
                 Column::SyncId
+            }
+            fn updated_at_node_id_column() -> Self::Column {
+                Column::UpdatedAtHlcId
             }
         }
 
@@ -1786,6 +1863,7 @@ pub(crate) mod tests {
                     end_hlc: last_hlc,
                     count,
                     chunk_hash: hash,
+                    fk_mappings: Default::default(),
                 });
             }
             Ok(sub_chunks)
@@ -1796,7 +1874,7 @@ pub(crate) mod tests {
             table_name: &str,
             start_hlc: &HLC,
             end_hlc: &HLC,
-        ) -> Result<Vec<E::Model>>
+        ) -> Result<RemoteRecordsWithPayload<E::Model>>
         where
             E: HLCModel + EntityTrait + Send + Sync,
             E::Model: HLCRecord + Send + Sync + for<'de> Deserialize<'de> + Serialize,
@@ -1818,7 +1896,7 @@ pub(crate) mod tests {
             let data_guard = self.remote_table_data.lock().await;
             let table_specific_data_json = match data_guard.get(table_name) {
                 Some(data) => data,
-                None => return Ok(Vec::new()),
+                None => return Ok(Default::default()),
             };
 
             let mut records: Vec<E::Model> = Vec::new();
@@ -1837,7 +1915,10 @@ pub(crate) mod tests {
                 }
             }
             records.sort_by_key(|m| m.updated_at_hlc());
-            Ok(records)
+            Ok(RemoteRecordsWithPayload {
+                records,
+                fk_payloads: Default::default(),
+            })
         }
 
         async fn apply_remote_changes<E>(
@@ -1969,7 +2050,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_synchronize_table_no_changes() -> Result<()> {
-        // ... (existing test code)
         let db = setup_db().await?;
         let local_node_id = Uuid::parse_str(LOCAL_NODE_STR)?;
         let remote_node_id = Uuid::parse_str(REMOTE_NODE_STR)?;
@@ -2008,7 +2088,13 @@ pub(crate) mod tests {
         };
 
         // Generate local chunks and set them as remote chunks for the mock
-        let local_chunks = generate_data_chunks::<Entity>(&db, &options, Some(start_hlc)).await?;
+        let local_chunks = generate_data_chunks::<Entity, NoOpForeignKeyResolver>(
+            &db,
+            &options,
+            Some(start_hlc),
+            None,
+        )
+        .await?;
         remote_source
             .set_remote_chunks_for_table("test_items", local_chunks.clone())
             .await;
@@ -2157,6 +2243,7 @@ pub(crate) mod tests {
             end_hlc: hlc1.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_record])?,
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk])
@@ -2255,9 +2342,13 @@ pub(crate) mod tests {
             node_id: local_node_id,
         };
         // Generate local chunks based on the actual local data
-        let local_chunks =
-            generate_data_chunks::<test_entity::Entity>(&db, &options, Some(start_hlc.clone()))
-                .await?;
+        let local_chunks = generate_data_chunks::<test_entity::Entity, NoOpForeignKeyResolver>(
+            &db,
+            &options,
+            Some(start_hlc.clone()),
+            None,
+        )
+        .await?;
 
         // Ensure local_chunks is not empty and contains the expected HLC
         assert!(!local_chunks.is_empty(), "Local chunks should not be empty");
@@ -2280,6 +2371,7 @@ pub(crate) mod tests {
             end_hlc: hlc_remote_old.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_record.clone()])?,
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk_data.clone()])
@@ -2395,9 +2487,13 @@ pub(crate) mod tests {
             alpha: 0.0,
             node_id: local_node_id,
         };
-        let local_chunks =
-            generate_data_chunks::<test_entity::Entity>(&db, &options, Some(start_hlc.clone()))
-                .await?;
+        let local_chunks = generate_data_chunks::<test_entity::Entity, NoOpForeignKeyResolver>(
+            &db,
+            &options,
+            Some(start_hlc.clone()),
+            None,
+        )
+        .await?;
         assert!(!local_chunks.is_empty(), "Local chunks should not be empty");
         let expected_local_chunk_hash = calculate_chunk_hash(&[local_record_model])?;
         assert_eq!(
@@ -2410,6 +2506,7 @@ pub(crate) mod tests {
             end_hlc: hlc_remote_new.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_record.clone()])?,
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk_data.clone()])
@@ -2526,15 +2623,20 @@ pub(crate) mod tests {
             alpha: 0.0,
             node_id: local_node_id,
         };
-        let local_chunks =
-            generate_data_chunks::<test_entity::Entity>(&db, &options, Some(start_hlc.clone()))
-                .await?; // Use test_entity::Entity
+        let local_chunks = generate_data_chunks::<test_entity::Entity, NoOpForeignKeyResolver>(
+            &db,
+            &options,
+            Some(start_hlc.clone()),
+            None,
+        )
+        .await?; // Use test_entity::Entity
         let remote_chunk_data = DataChunk {
             // Renamed
             start_hlc: hlc_remote_tie.clone(),
             end_hlc: hlc_remote_tie.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_record])?,
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk_data])
@@ -2686,7 +2788,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_apply_local_changes_rollback() -> Result<()> {
-        // ... (existing test code)
         let db = setup_db().await?;
         let local_node_id = Uuid::parse_str(LOCAL_NODE_STR)?;
         let remote_node_id = Uuid::parse_str(REMOTE_NODE_STR)?;
@@ -2815,13 +2916,19 @@ pub(crate) mod tests {
             alpha: 0.0,
             node_id: local_node_id,
         };
-        let local_chunks =
-            generate_data_chunks::<Entity>(&db, &options, Some(start_hlc.clone())).await?;
+        let local_chunks = generate_data_chunks::<Entity, NoOpForeignKeyResolver>(
+            &db,
+            &options,
+            Some(start_hlc.clone()),
+            None,
+        )
+        .await?;
         let remote_chunk = DataChunk {
             start_hlc: common_hlc.clone(), // Chunk covers the record's HLC
             end_hlc: common_hlc.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_record.clone()])?, // Hash based on remote data
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk.clone()])
@@ -2871,7 +2978,6 @@ pub(crate) mod tests {
         )
         .await?;
 
-        // ... rest of the assertions from the original test ...
         let get_records_calls = remote_source
             .get_records_call_ranges_for_table("test_items")
             .await;
@@ -2955,7 +3061,7 @@ pub(crate) mod tests {
             remote_records.push(remote.clone());
         }
         let chunk_hlc_end = current_hlc.clone(); // HLC of the last record
-        let chunk_hlc_start = first_record_hlc.expect("Should have inserted at least one record"); // <--- Use the actual first HLC
+        let chunk_hlc_start = first_record_hlc.expect("Should have inserted at least one record");
 
         remote_source
             .set_remote_data_for_table("test_items", remote_records.clone())
@@ -2969,13 +3075,19 @@ pub(crate) mod tests {
             alpha: 0.0,
             node_id: local_node_id,
         };
-        let local_chunks =
-            generate_data_chunks::<Entity>(&db, &options, Some(start_hlc.clone())).await?;
+        let local_chunks = generate_data_chunks::<Entity, NoOpForeignKeyResolver>(
+            &db,
+            &options,
+            Some(start_hlc.clone()),
+            None,
+        )
+        .await?;
         let remote_chunk = DataChunk {
-            start_hlc: chunk_hlc_start.clone(), // <--- Use correct start HLC
+            start_hlc: chunk_hlc_start.clone(),
             end_hlc: chunk_hlc_end.clone(),
             count: record_count,
             chunk_hash: calculate_chunk_hash(&remote_records)?, // Different hash
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk.clone()])
@@ -3036,8 +3148,9 @@ pub(crate) mod tests {
             "Should have requested sub-chunks once"
         );
         assert_eq!(
-            sub_chunk_requests[0].0, local_chunks[0],
-            "Sub-chunk request should be for the mismatched local chunk"
+            sub_chunk_requests[0].0, // This IS remote_chunk.clone() from the pair
+            remote_chunk, // Compare it to the original remote_chunk definition from the test setup
+            "Sub-chunk request should be for the remote's definition of the chunk in the pair"
         ); // Parent chunk matches local
         assert_eq!(
             sub_chunk_requests[0].1, COMPARISON_THRESHOLD,
@@ -3131,13 +3244,19 @@ pub(crate) mod tests {
             alpha: 0.0,
             node_id: local_node_id,
         }; // Allow slightly larger chunks
-        let local_chunks =
-            generate_data_chunks::<Entity>(&db, &options, Some(start_hlc.clone())).await?;
+        let local_chunks = generate_data_chunks::<Entity, NoOpForeignKeyResolver>(
+            &db,
+            &options,
+            Some(start_hlc.clone()),
+            None,
+        )
+        .await?;
         let remote_chunk = DataChunk {
             start_hlc: hlc3.clone(), // Starts later than local chunk
             end_hlc: hlc4.clone(),
             count: 2,
             chunk_hash: calculate_chunk_hash(&[r1.clone(), r2.clone()])?,
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk.clone()])
@@ -3289,12 +3408,14 @@ pub(crate) mod tests {
             end_hlc: hlc_remote_insert.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[r_new.clone()])?,
+            fk_mappings: Default::default(),
         };
         let remote_chunk2 = DataChunk {
             start_hlc: hlc_remote_update.clone(),
             end_hlc: hlc_remote_update.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[r_update.clone()])?,
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk1, remote_chunk2])
@@ -3415,6 +3536,7 @@ pub(crate) mod tests {
             end_hlc: hlc_remote_old.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[r_old.clone()])?,
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk])
@@ -3572,13 +3694,19 @@ pub(crate) mod tests {
             node_id: local_node_id,
         };
         // Generate local chunk based on the inserted record
-        let local_chunks =
-            generate_data_chunks::<Entity>(&db, &options, Some(start_hlc.clone())).await?;
+        let local_chunks = generate_data_chunks::<Entity, NoOpForeignKeyResolver>(
+            &db,
+            &options,
+            Some(start_hlc.clone()),
+            None,
+        )
+        .await?;
         let remote_chunk = DataChunk {
             start_hlc: data_hlc.clone(),
             end_hlc: data_hlc.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_record])?,
+            fk_mappings: Default::default(),
         };
         remote_source
             .set_remote_chunks_for_table("test_items", vec![remote_chunk.clone()])
@@ -3726,9 +3854,11 @@ pub(crate) mod tests {
     }
 
     pub mod author_entity {
+        use std::collections::HashMap;
         use std::str::FromStr;
 
         use anyhow::{anyhow, Result};
+        use async_trait::async_trait;
         use sea_orm::entity::prelude::*;
         use sea_orm::{
             ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter,
@@ -3736,7 +3866,11 @@ pub(crate) mod tests {
         use serde::{Deserialize, Serialize};
         use uuid::Uuid;
 
+        use crate::chunking::ChunkFkMapping;
         use crate::core::PrimaryKeyFromStr;
+        use crate::foreign_key::{
+            ActiveModelWithForeignKeyOps, DatabaseExecutor, FkPayload, ModelWithForeignKeyOps,
+        };
         use crate::hlc::{HLCModel, HLCRecord, HLC};
 
         #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
@@ -3818,6 +3952,56 @@ pub(crate) mod tests {
             }
         }
 
+        #[async_trait]
+        impl ModelWithForeignKeyOps for Model {
+            /// Authors do not reference other entities with foreign keys in this schema.
+            async fn extract_model_fk_sync_ids<E: DatabaseExecutor>(
+                &self,
+                _db: &E, // db not needed as no outgoing FKs
+            ) -> Result<FkPayload> {
+                Ok(FkPayload::new())
+            }
+
+            /// When generating chunks of Author models, create mappings from the Author's local PK
+            /// to its sync_id. This is used by consumers of this chunk (e.g., Post entity)
+            /// to resolve their foreign key references to Authors.
+            async fn generate_model_fk_mappings_for_batch<E: DatabaseExecutor>(
+                records: &[Self],
+                _db: &E, // db not strictly needed here as models have id/sync_id
+            ) -> Result<ChunkFkMapping> {
+                let mut author_pk_to_sync_id_map = HashMap::new();
+                for record in records {
+                    // Map local primary key (as string) to sync_id
+                    author_pk_to_sync_id_map.insert(record.id.to_string(), record.sync_id.clone());
+                }
+                let mut chunk_fk_mapping = ChunkFkMapping::new();
+                // Store this mapping keyed by the foreign key column name *in the child table* that references this entity.
+                // In this case, the child is Post and the column is 'author_id'.
+                chunk_fk_mapping.insert("author_id".to_string(), author_pk_to_sync_id_map);
+                Ok(chunk_fk_mapping)
+            }
+
+            /// Authors do not consume foreign keys received from a remote.
+            fn extract_model_sync_ids_from_remote(
+                &self,
+                _chunk_fk_map: &ChunkFkMapping, // map not needed as authors don't consume FKs this way
+            ) -> Result<FkPayload> {
+                Ok(FkPayload::new())
+            }
+        }
+
+        #[async_trait]
+        impl ActiveModelWithForeignKeyOps for ActiveModel {
+            /// Authors have no foreign keys to remap based on sync_id.
+            async fn remap_model_and_set_foreign_keys<E: DatabaseExecutor>(
+                &mut self,
+                _fk_sync_id_payload: &FkPayload, // payload not needed
+                _db: &E,                         // db not needed
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
         impl HLCModel for Entity {
             fn updated_at_time_column() -> Self::Column {
                 Column::UpdatedAtHlcTs
@@ -3827,6 +4011,9 @@ pub(crate) mod tests {
             }
             fn unique_id_column() -> Self::Column {
                 Column::SyncId
+            }
+            fn updated_at_node_id_column() -> Self::Column {
+                Column::CreatedAtHlcId
             }
         }
 
@@ -3848,17 +4035,24 @@ pub(crate) mod tests {
 
     #[cfg(test)]
     pub mod post_entity {
+        use std::collections::HashMap as StdHashMap;
+        use std::println as warn;
         use std::str::FromStr;
 
-        use anyhow::{anyhow, Result};
+        use anyhow::{anyhow, Context, Result};
+        use async_trait::async_trait;
         use sea_orm::entity::prelude::*;
         use sea_orm::{
-            ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter,
+            ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Set,
         };
         use serde::{Deserialize, Serialize};
         use uuid::Uuid;
 
+        use crate::chunking::ChunkFkMapping;
         use crate::core::PrimaryKeyFromStr;
+        use crate::foreign_key::{
+            ActiveModelWithForeignKeyOps, DatabaseExecutor, FkPayload, ModelWithForeignKeyOps,
+        };
         use crate::hlc::{HLCModel, HLCRecord, HLC};
 
         #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
@@ -3959,6 +4153,133 @@ pub(crate) mod tests {
             }
         }
 
+        #[async_trait]
+        impl ModelWithForeignKeyOps for Model {
+            async fn extract_model_fk_sync_ids<E: DatabaseExecutor>(
+                &self,
+                db: &E,
+            ) -> Result<FkPayload> {
+                let mut payload = FkPayload::new();
+                // Assuming author_id is non-nullable. If it can be null, handle Option<i32> and insert None for payload.
+                if let Some(author) = super::author_entity::Entity::find_by_id(self.author_id)
+                    .one(db)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to find author by id {} for post {}",
+                            self.author_id, self.sync_id
+                        )
+                    })?
+                {
+                    payload.insert("author_id".to_string(), Some(author.sync_id));
+                } else {
+                    // This implies a data integrity issue if author_id is a non-nullable FK.
+                    return Err(anyhow!(
+                        "Data integrity issue: Author with id {} referenced by post {} not found.",
+                        self.author_id,
+                        self.sync_id
+                    ));
+                }
+                Ok(payload)
+            }
+
+            async fn generate_model_fk_mappings_for_batch<E: DatabaseExecutor>(
+                records: &[Self],
+                db: &E,
+            ) -> Result<ChunkFkMapping> {
+                let mut chunk_fk_mapping = ChunkFkMapping::new();
+                if records.is_empty() {
+                    return Ok(chunk_fk_mapping);
+                }
+
+                let author_pks: Vec<i32> = records.iter().map(|post| post.author_id).collect();
+
+                let authors = super::author_entity::Entity::find()
+                    .filter(super::author_entity::Column::Id.is_in(author_pks))
+                    .all(db)
+                    .await
+                    .with_context(|| "Failed to fetch authors for FK mapping generation")?;
+
+                let author_pk_to_sync_id: StdHashMap<i32, String> = authors
+                    .into_iter()
+                    .map(|author| (author.id, author.sync_id))
+                    .collect();
+
+                let mut author_id_column_mapping = StdHashMap::new();
+                for post_model in records {
+                    if let Some(author_sync_id) = author_pk_to_sync_id.get(&post_model.author_id) {
+                        // Key: The local PK of the author (post_model.author_id as String)
+                        // Value: The sync_id of the author
+                        author_id_column_mapping
+                            .insert(post_model.author_id.to_string(), author_sync_id.clone());
+                    } else {
+                        warn!(
+                            "generate_fk_mappings_for_records (Post): Author with local PK {} not found for post with sync_id {}.",
+                            post_model.author_id,
+                            post_model.sync_id
+                        );
+                        // Decide if this is an error or if None should be stored. For now, just warn and skip.
+                    }
+                }
+
+                if !author_id_column_mapping.is_empty() {
+                    chunk_fk_mapping.insert("author_id".to_string(), author_id_column_mapping);
+                }
+                Ok(chunk_fk_mapping)
+            }
+
+            fn extract_model_sync_ids_from_remote(
+                &self,
+                _chunk_fk_map: &ChunkFkMapping, // Test models use direct `remote_author_sync_id`
+            ) -> Result<FkPayload> {
+                let mut payload = FkPayload::new();
+                // This relies on the test setup populating `remote_author_sync_id`
+                payload.insert("author_id".to_string(), self.remote_author_sync_id.clone());
+                Ok(payload)
+            }
+        }
+
+        #[async_trait]
+        impl ActiveModelWithForeignKeyOps for ActiveModel {
+            async fn remap_model_and_set_foreign_keys<E: DatabaseExecutor>(
+                &mut self,
+                fk_sync_id_payload: &FkPayload,
+                db: &E,
+            ) -> Result<()> {
+                if let Some(maybe_author_sync_id) = fk_sync_id_payload.get("author_id") {
+                    if let Some(author_sync_id) = maybe_author_sync_id {
+                        if let Some(author) = super::author_entity::Entity::find()
+                            .filter(super::author_entity::Column::SyncId.eq(author_sync_id.clone()))
+                            .one(db)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to find author by sync_id {} for remapping FK",
+                                    author_sync_id
+                                )
+                            })?
+                        {
+                            self.author_id = Set(author.id);
+                        } else {
+                            return Err(anyhow!(
+                                "FK Remap (Post): Author with sync_id '{}' not found locally.",
+                                author_sync_id
+                            ));
+                        }
+                    } else {
+                        // The FkPayload indicates a NULL foreign key.
+                        // Post.author_id is `i32`, not `Option<i32>`, so it's non-nullable.
+                        // This is an error condition if the schema enforces non-nullability.
+                        return Err(anyhow!(
+                            "FK Remap (Post): Attempted to set non-nullable author_id to NULL."
+                        ));
+                    }
+                }
+                // If "author_id" is not in payload, do nothing (field not being changed or not applicable).
+                Ok(())
+            }
+        }
+
         impl HLCModel for Entity {
             fn updated_at_time_column() -> Self::Column {
                 Column::UpdatedAtHlcTs
@@ -3968,6 +4289,9 @@ pub(crate) mod tests {
             }
             fn unique_id_column() -> Self::Column {
                 Column::SyncId
+            }
+            fn updated_at_node_id_column() -> Self::Column {
+                Column::CreatedAtHlcId
             }
         }
 
@@ -4041,104 +4365,54 @@ pub(crate) mod tests {
     #[derive(Debug)]
     struct TestForeignKeyResolver;
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl ForeignKeyResolver for TestForeignKeyResolver {
-        async fn extract_foreign_key_sync_ids<
-            M: HLCRecord + Send + Sync + Serialize,
-            E: DatabaseExecutor + ConnectionTrait, // Renamed E to E_DB for clarity in this scope
-        >(
-            &self,
-            table_name: &str,
-            model: &M,
-            db: &E, // E here is the DatabaseExecutor
-        ) -> Result<FkPayload> {
-            let mut payload = FkPayload::new();
-            if table_name == "posts" {
-                let model_json = serde_json::to_value(model)?;
-                let post_model: post_entity::Model = serde_json::from_value(model_json)?;
-
-                // Fetch the author using the local integer FK from post_model
-                if let Some(author) = author_entity::Entity::find_by_id(post_model.author_id)
-                    .one(db) // db is E (DatabaseExecutor)
-                    .await?
-                {
-                    // Store the parent's sync_id in the payload
-                    payload.insert("author_id".to_string(), Some(author.sync_id));
-                } else {
-                    // If author_id is supposed to be non-nullable and points to a non-existent author
-                    return Err(anyhow!(
-                        "Author not found for post_model.author_id: {} when extracting FKs for table '{}'",
-                        post_model.author_id, table_name
-                    ));
-                    // If author_id can be legitimately null or unlinked, then:
-                    // payload.insert("author_id".to_string(), None);
-                }
-            }
-            Ok(payload)
+        async fn extract_foreign_key_sync_ids<M, E>(&self, model: &M, db: &E) -> Result<FkPayload>
+        where
+            M: ModelWithForeignKeyOps,
+            E: DatabaseExecutor,
+        {
+            model.extract_model_fk_sync_ids(db).await
         }
 
-        fn extract_sync_ids_from_remote_model<M: HLCRecord + Send + Sync + Serialize>(
+        async fn remap_and_set_foreign_keys<AM, E>(
             &self,
-            table_name: &str,
-            remote_model_with_sync_id_fks: &M,
-        ) -> Result<FkPayload> {
-            let mut payload = FkPayload::new();
-            if table_name == "posts" {
-                let model_json = serde_json::to_value(remote_model_with_sync_id_fks)?;
-                let post_model: post_entity::Model = serde_json::from_value(model_json)?;
-                // remote_author_sync_id is Option<String> on the post_entity::Model (transient field)
-                payload.insert("author_id".to_string(), post_model.remote_author_sync_id);
-            }
-            Ok(payload)
-        }
-
-        async fn remap_and_set_foreign_keys<
-            AM: ActiveModelBehavior + Send,
-            DB: DatabaseExecutor + ConnectionTrait,
-        >(
-            &self,
-            table_name: &str,
             active_model: &mut AM,
             fk_payload: &FkPayload,
-            db: &DB,
+            db: &E,
         ) -> Result<()>
         where
-            AM::Entity: EntityTrait, // EntityTrait implies ActiveModelTrait::Entity has Column
-            <AM::Entity as EntityTrait>::Column: sea_orm::ColumnTrait + sea_orm::Iterable, // Use sea_orm::Iterable
+            AM: ActiveModelWithForeignKeyOps,
+            E: DatabaseExecutor,
         {
-            if table_name == "posts" {
-                let author_id_column_name = "author_id";
-                // The .iter() method comes from sea_orm::Iterable
-                let column_to_set = <AM::Entity as EntityTrait>::Column::iter()
-                    .find(|c| c.as_str() == author_id_column_name)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Column '{}' not found in ActiveModel for table '{}'",
-                            author_id_column_name,
-                            table_name
-                        )
-                    })?;
+            active_model
+                .remap_model_and_set_foreign_keys(fk_payload, db)
+                .await
+        }
 
-                if let Some(maybe_author_sync_id) = fk_payload.get("author_id") {
-                    if let Some(author_sync_id) = maybe_author_sync_id {
-                        if let Some(author) = author_entity::Entity::find()
-                            .filter(author_entity::Column::SyncId.eq(author_sync_id.clone()))
-                            .one(db)
-                            .await?
-                        {
-                            active_model.set(column_to_set, author.id.into());
-                        } else {
-                            return Err(anyhow!(
-                                "FK Remap: Author with sync_id '{}' not found locally for table '{}'.",
-                                author_sync_id, table_name
-                            ));
-                        }
-                    } else {
-                        active_model.set(column_to_set, sea_orm::Value::Int(None));
-                    }
-                }
-            }
-            Ok(())
+        fn extract_sync_ids_from_remote_model_with_mapping<M>(
+            &self,
+            remote_model_with_sync_id_fks: &M,
+            chunk_fk_map: Option<&ChunkFkMapping>,
+        ) -> Result<FkPayload>
+        where
+            M: ModelWithForeignKeyOps,
+        {
+            // Pass an empty map if None, as the model might not use it if it has direct fields (like Post.remote_author_sync_id)
+            remote_model_with_sync_id_fks
+                .extract_model_sync_ids_from_remote(chunk_fk_map.unwrap_or(&ChunkFkMapping::new()))
+        }
+
+        async fn generate_fk_mappings_for_records<M, E>(
+            &self,
+            records: &[M],
+            db: &E,
+        ) -> Result<ChunkFkMapping>
+        where
+            M: ModelWithForeignKeyOps,
+            E: DatabaseExecutor,
+        {
+            M::generate_model_fk_mappings_for_batch(records, db).await
         }
     }
 
@@ -4181,12 +4455,13 @@ pub(crate) mod tests {
         remote_source
             .set_remote_data_for_table("authors", vec![remote_author1_model.clone()])
             .await?;
-        // Create remote chunks for authors
+
         let remote_author_chunk = DataChunk {
             start_hlc: hlc_author_v1.clone(),
             end_hlc: hlc_author_v1.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_author1_model.clone()])?,
+            fk_mappings: Default::default(), // Authors don't have FKs in this model
         };
         remote_source
             .set_remote_chunks_for_table("authors", vec![remote_author_chunk])
@@ -4196,8 +4471,8 @@ pub(crate) mod tests {
             id: 201, // Mock remote PK
             sync_id: "post_sync_1".to_string(),
             title: "Remote Post 1".to_string(),
-            author_id: 101, // Remote's local FK to its author_sync_1
-            remote_author_sync_id: Some("author_sync_1".to_string()), // Critical for resolver
+            author_id: remote_author1_model.id, // Remote's local FK to its author_sync_1
+            remote_author_sync_id: Some(remote_author1_model.sync_id.clone()), // Critical for resolver
             created_at_hlc_ts: hlc_timestamp_millis_to_rfc3339(hlc_post_v1_remote.timestamp)?,
             created_at_hlc_ct: hlc_post_v1_remote.version as i32,
             created_at_hlc_id: hlc_post_v1_remote.node_id,
@@ -4208,28 +4483,38 @@ pub(crate) mod tests {
         remote_source
             .set_remote_data_for_table("posts", vec![remote_post1_model.clone()])
             .await?;
+
+        let mut post_fk_mappings = ChunkFkMapping::new();
+        let mut author_map = HashMap::new();
+        author_map.insert(
+            remote_author1_model.id.to_string(),
+            remote_author1_model.sync_id.clone(),
+        );
+        post_fk_mappings.insert("author_id".to_string(), author_map);
+
         let remote_post_chunk = DataChunk {
             start_hlc: hlc_post_v1_remote.clone(),
             end_hlc: hlc_post_v1_remote.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_post1_model.clone()])?,
+            fk_mappings: Some(post_fk_mappings),
         };
         remote_source
             .set_remote_chunks_for_table("posts", vec![remote_post_chunk])
             .await;
 
         let hlc_context = SyncTaskContext::new(local_node_id);
-        let options = ChunkingOptions::default(local_node_id); // Small chunks by default
-        let mut context = SyncContext {
+        let options = ChunkingOptions::default(local_node_id);
+        let context = SyncContext {
             db: &db,
             local_node_id,
             remote_source: &remote_source,
             chunking_options: options.clone(),
-            sync_direction: SyncDirection::Pull, // Pull for authors first
+            sync_direction: SyncDirection::Pull,
             hlc_context: &hlc_context,
         };
 
-        // Sync authors (PULL) - should be no change if data is identical
+        // Sync authors (PULL)
         let author_initial_metadata = SyncTableMetadata {
             table_name: "authors".to_string(),
             last_sync_hlc: hlc_start_sync.clone(),
@@ -4247,7 +4532,6 @@ pub(crate) mod tests {
         );
 
         // Sync posts (PULL)
-        context.sync_direction = SyncDirection::Pull;
         let post_initial_metadata = SyncTableMetadata {
             table_name: "posts".to_string(),
             last_sync_hlc: hlc_start_sync.clone(),
@@ -4321,7 +4605,6 @@ pub(crate) mod tests {
 
         // Remote: Author R_A1 (same as local), no posts
         let remote_author1_model = author_entity::Model {
-            // Identical to local one for simplicity
             id: 101,
             sync_id: "author_sync_1".to_string(),
             name: "Local Author 1".to_string(),
@@ -4340,25 +4623,26 @@ pub(crate) mod tests {
             end_hlc: hlc_author_v1.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_author1_model.clone()])?,
+            fk_mappings: Default::default(), // Authors don't have FKs
         };
         remote_source
             .set_remote_chunks_for_table("authors", vec![remote_author_chunk])
             .await;
         remote_source
             .set_remote_data_for_table::<post_entity::Model>("posts", vec![])
-            .await?; // No remote posts
+            .await?;
         remote_source
-            .set_remote_chunks_for_table("posts", vec![])
-            .await; // No remote post chunks
+            .set_remote_chunks_for_table("posts", vec![]) // No remote post chunks
+            .await;
 
         let hlc_context = SyncTaskContext::new(local_node_id);
         let options = ChunkingOptions::default(local_node_id);
-        let mut context = SyncContext {
+        let context = SyncContext {
             db: &db,
             local_node_id,
             remote_source: &remote_source,
             chunking_options: options.clone(),
-            sync_direction: SyncDirection::Push, // Push for authors first
+            sync_direction: SyncDirection::Push,
             hlc_context: &hlc_context,
         };
 
@@ -4377,7 +4661,7 @@ pub(crate) mod tests {
         assert_eq!(author_final_metadata.last_sync_hlc, hlc_author_v1);
 
         // Sync posts (PUSH)
-        context.sync_direction = SyncDirection::Push;
+        // context.sync_direction = SyncDirection::Push; // Already set
         let post_initial_metadata = SyncTableMetadata {
             table_name: "posts".to_string(),
             last_sync_hlc: hlc_start_sync.clone(),
@@ -4405,7 +4689,6 @@ pub(crate) mod tests {
                 assert_eq!(model.sync_id, "post_sync_1");
                 assert_eq!(model.title, "Local Post 1");
                 assert_eq!(model.updated_at_hlc().unwrap(), hlc_post_v1_local);
-                // The model's author_id is the local integer FK.
                 assert_eq!(model.author_id, local_author1.id);
 
                 let expected_fk_author_sync_id =
@@ -4419,7 +4702,6 @@ pub(crate) mod tests {
             _ => panic!("Expected InsertRemote operation for post"),
         }
 
-        // Verify remote mock data state (optional, depends on mock's apply_remote_changes sophistication)
         let remote_posts_data_guard = remote_source.remote_table_data.lock().await;
         let remote_posts_table = remote_posts_data_guard
             .get("posts")
@@ -4430,7 +4712,6 @@ pub(crate) mod tests {
         let remote_post_stored: post_entity::Model =
             serde_json::from_value(remote_post_json.clone())?;
         assert_eq!(remote_post_stored.title, "Local Post 1");
-        // How author_id is stored in mock depends on mock's logic. Here it just stores the model as-is.
 
         assert_eq!(post_final_metadata.last_sync_hlc, hlc_post_v1_local);
         Ok(())
@@ -4446,8 +4727,8 @@ pub(crate) mod tests {
         let hlc_start_sync = hlc(BASE_TS, 0, LOCAL_NODE_STR);
         let hlc_author1_v1 = hlc(BASE_TS + 100, 0, LOCAL_NODE_STR);
         let hlc_author2_v1 = hlc(BASE_TS + 110, 0, LOCAL_NODE_STR);
-        let hlc_post_v1_local = hlc(BASE_TS + 200, 0, LOCAL_NODE_STR); // Post P1 original (local)
-        let hlc_post_v1_remote_reparented = hlc(BASE_TS + 300, 0, REMOTE_NODE_STR); // Post P1 updated and reparented (remote)
+        let hlc_post_v1_local = hlc(BASE_TS + 200, 0, LOCAL_NODE_STR);
+        let hlc_post_v1_remote_reparented = hlc(BASE_TS + 300, 0, REMOTE_NODE_STR);
 
         // Local: Authors L_A1, L_A2. Post L_P1 belongs to L_A1.
         let local_author1 = insert_author_record(
@@ -4477,43 +4758,48 @@ pub(crate) mod tests {
         .await?;
 
         // Remote: Authors R_A1, R_A2 (same as local). Post R_P1 belongs to R_A2 (reparented) and is newer.
-        let common_author_setup =
-            |sync_id: &str, hlc_val: &HLC, name_prefix: &str| -> author_entity::Model {
-                author_entity::Model {
-                    id: if sync_id == "author_sync_1" { 101 } else { 102 },
-                    sync_id: sync_id.to_string(),
-                    name: format!("{} {}", name_prefix, sync_id.chars().last().unwrap()),
-                    created_at_hlc_ts: hlc_timestamp_millis_to_rfc3339(hlc_val.timestamp).unwrap(),
-                    created_at_hlc_ct: hlc_val.version as i32,
-                    created_at_hlc_id: hlc_val.node_id,
-                    updated_at_hlc_ts: hlc_timestamp_millis_to_rfc3339(hlc_val.timestamp).unwrap(),
-                    updated_at_hlc_ct: hlc_val.version as i32,
-                    updated_at_hlc_id: hlc_val.node_id,
-                }
-            };
+        let common_author_setup = |sync_id: &str,
+                                   hlc_val: &HLC,
+                                   name_prefix: &str,
+                                   id_val: i32|
+         -> author_entity::Model {
+            author_entity::Model {
+                id: id_val,
+                sync_id: sync_id.to_string(),
+                name: format!("{} {}", name_prefix, sync_id.chars().last().unwrap()),
+                created_at_hlc_ts: hlc_timestamp_millis_to_rfc3339(hlc_val.timestamp).unwrap(),
+                created_at_hlc_ct: hlc_val.version as i32,
+                created_at_hlc_id: hlc_val.node_id,
+                updated_at_hlc_ts: hlc_timestamp_millis_to_rfc3339(hlc_val.timestamp).unwrap(),
+                updated_at_hlc_ct: hlc_val.version as i32,
+                updated_at_hlc_id: hlc_val.node_id,
+            }
+        };
         let remote_author1_model =
-            common_author_setup("author_sync_1", &hlc_author1_v1, "Remote Author");
+            common_author_setup("author_sync_1", &hlc_author1_v1, "Remote Author", 101);
         let remote_author2_model =
-            common_author_setup("author_sync_2", &hlc_author2_v1, "Remote Author");
+            common_author_setup("author_sync_2", &hlc_author2_v1, "Remote Author", 102);
         remote_source
             .set_remote_data_for_table(
                 "authors",
                 vec![remote_author1_model.clone(), remote_author2_model.clone()],
             )
             .await?;
-        // Remote author chunks (simplified - assuming they cover these HLCs)
+
         let remote_author_chunks = vec![
             DataChunk {
                 start_hlc: hlc_author1_v1.clone(),
                 end_hlc: hlc_author1_v1.clone(),
                 count: 1,
                 chunk_hash: calculate_chunk_hash(&[remote_author1_model.clone()])?,
+                fk_mappings: Default::default(),
             },
             DataChunk {
                 start_hlc: hlc_author2_v1.clone(),
                 end_hlc: hlc_author2_v1.clone(),
                 count: 1,
                 chunk_hash: calculate_chunk_hash(&[remote_author2_model.clone()])?,
+                fk_mappings: Default::default(),
             },
         ];
         remote_source
@@ -4521,28 +4807,38 @@ pub(crate) mod tests {
             .await;
 
         let remote_post1_reparented_model = post_entity::Model {
-            id: 201,
+            id: 201, // Mock remote PK
             sync_id: "post_sync_1".to_string(),
             title: "New Title Reparented".to_string(),
-            author_id: 102, // Remote's local FK to its author_sync_2
-            remote_author_sync_id: Some("author_sync_2".to_string()), // CRITICAL: points to Author 2
-            created_at_hlc_ts: hlc_timestamp_millis_to_rfc3339(hlc_post_v1_local.timestamp)?, // Assume original creation HLC
+            author_id: remote_author2_model.id, // Remote's local FK to its author_sync_2
+            remote_author_sync_id: Some(remote_author2_model.sync_id.clone()), // CRITICAL: points to Author 2
+            created_at_hlc_ts: hlc_timestamp_millis_to_rfc3339(hlc_post_v1_local.timestamp)?,
             created_at_hlc_ct: hlc_post_v1_local.version as i32,
             created_at_hlc_id: hlc_post_v1_local.node_id,
             updated_at_hlc_ts: hlc_timestamp_millis_to_rfc3339(
                 hlc_post_v1_remote_reparented.timestamp,
-            )?, // Newer update HLC
+            )?,
             updated_at_hlc_ct: hlc_post_v1_remote_reparented.version as i32,
             updated_at_hlc_id: hlc_post_v1_remote_reparented.node_id,
         };
         remote_source
             .set_remote_data_for_table("posts", vec![remote_post1_reparented_model.clone()])
             .await?;
+
+        let mut post_fk_mappings = ChunkFkMapping::new();
+        let mut author_map_for_post = HashMap::new();
+        author_map_for_post.insert(
+            remote_author2_model.id.to_string(),
+            remote_author2_model.sync_id.clone(),
+        );
+        post_fk_mappings.insert("author_id".to_string(), author_map_for_post);
+
         let remote_post_chunk = DataChunk {
             start_hlc: hlc_post_v1_remote_reparented.clone(),
             end_hlc: hlc_post_v1_remote_reparented.clone(),
             count: 1,
             chunk_hash: calculate_chunk_hash(&[remote_post1_reparented_model.clone()])?,
+            fk_mappings: Some(post_fk_mappings),
         };
         remote_source
             .set_remote_chunks_for_table("posts", vec![remote_post_chunk])
@@ -4550,7 +4846,7 @@ pub(crate) mod tests {
 
         let hlc_context = SyncTaskContext::new(local_node_id);
         let options = ChunkingOptions::default(local_node_id);
-        let mut context = SyncContext {
+        let context = SyncContext {
             db: &db,
             local_node_id,
             remote_source: &remote_source,
@@ -4571,14 +4867,12 @@ pub(crate) mod tests {
             &author_initial_metadata,
         )
         .await?;
-        // Max HLC for authors could be hlc_author2_v1 if sorting by HLC
-        assert!(
-            author_final_metadata.last_sync_hlc >= hlc_author1_v1
-                && author_final_metadata.last_sync_hlc >= hlc_author2_v1
-        );
+
+        let expected_max_author_hlc = std::cmp::max(hlc_author1_v1.clone(), hlc_author2_v1.clone());
+        assert_eq!(author_final_metadata.last_sync_hlc, expected_max_author_hlc);
 
         // Sync posts (PULL)
-        context.sync_direction = SyncDirection::Pull;
+        // context.sync_direction = SyncDirection::Pull; // Already set
         let post_initial_metadata = SyncTableMetadata {
             table_name: "posts".to_string(),
             last_sync_hlc: hlc_start_sync.clone(),
