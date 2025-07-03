@@ -34,7 +34,7 @@
 //! and SeaORM.
 
 use std::{
-    cmp::Ordering,
+    cmp::{self, Ordering},
     str::FromStr,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -43,7 +43,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use blake3::Hasher;
-use chrono::{LocalResult, TimeZone, Utc};
+use chrono::DateTime;
 use sea_orm::{
     entity::prelude::*, Condition, DatabaseConnection, DeleteResult, FromQueryResult,
     PaginatorTrait, QueryFilter, QueryOrder,
@@ -51,93 +51,15 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Converts a Unix timestamp (in milliseconds since epoch) to an RFC3339 formatted string for DB.
-/// SeaORM often uses chrono::DateTime<Utc> which maps well to RFC3339.
-/// NOTE: HLC uses milliseconds, but DB timestamp columns might store seconds or need specific formats.
-/// This function assumes the DB expects RFC3339 UTC. Adjust if your DB type differs.
-pub fn hlc_timestamp_millis_to_rfc3339(millis: u64) -> Result<String> {
-    // Convert milliseconds to seconds and nanoseconds
-    let secs = (millis / 1000) as i64;
-    let nanos = ((millis % 1000) * 1_000_000) as u32;
-
-    match Utc.timestamp_opt(secs, nanos) {
-        LocalResult::Single(datetime) => {
-            // Format to RFC3339 with milliseconds precision
-            let rfc3339_string = datetime.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            Ok(rfc3339_string)
-        }
-        LocalResult::None => {
-            bail!("HLC Milliseconds timestamp is out of range: {}", millis)
-        }
-        LocalResult::Ambiguous(..) => {
-            // Ambiguous should not happen for UTC timestamps
-            bail!(
-                "HLC Milliseconds timestamp is ambiguous (should not happen for UTC): {}",
-                millis
-            )
-        }
-    }
-}
-
-#[cfg(test)]
-mod timestamp_tests {
-    // Renamed inner mod tests to avoid conflict
-    use super::*;
-
-    #[test]
-    fn test_hlc_millis_to_rfc3339_valid() -> Result<()> {
-        let millis: u64 = 1678838400123; // March 15, 2023 00:00:00.123 UTC
-        let rfc3339_string = hlc_timestamp_millis_to_rfc3339(millis)?;
-        // chrono format includes '+00:00' instead of 'Z' sometimes, both are valid RFC3339 UTC.
-        assert!(
-            rfc3339_string == "2023-03-15T00:00:00.123000000Z"
-                || rfc3339_string == "2023-03-15T00:00:00.123000000+00:00"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_hlc_millis_to_rfc3339_zero() -> Result<()> {
-        let millis: u64 = 0; // Epoch
-        let rfc3339_string = hlc_timestamp_millis_to_rfc3339(millis)?;
-        assert!(
-            rfc3339_string == "1970-01-01T00:00:00.000000000Z"
-                || rfc3339_string == "1970-01-01T00:00:00.000000000+00:00"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_hlc_millis_out_of_range() {
-        // chrono's range is roughly +/- 262,000 years from 1970.
-        // u64::MAX milliseconds is far beyond that.
-        let invalid_millis: u64 = u64::MAX;
-        let result = hlc_timestamp_millis_to_rfc3339(invalid_millis);
-        assert!(result.is_err());
-        let error_message = result.err().unwrap().to_string();
-        println!("Out of range error: {}", error_message); // Print error for info
-        assert!(error_message.contains("HLC Milliseconds timestamp is out of range"));
-    }
-
-    #[test]
-    fn test_hlc_millis_to_rfc3339_ambiguous_unreachable() {
-        // Using chrono::Utc prevents ambiguous results, which typically occur during
-        // DST transitions in local time zones. This test case exists to acknowledge
-        // the code path, although it cannot be practically triggered with Utc.
-        // If the function were generic over TimeZone, a local zone could trigger this.
-        println!("Note: LocalResult::Ambiguous is not reachable with Utc timezone.");
-    }
-}
-
 /// Represents a Hybrid Logical Clock (HLC).
 ///
 /// An HLC combines a physical timestamp with a logical counter to ensure
 /// monotonically increasing timestamps across a distributed system, even
 /// with clock skew.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 pub struct HLC {
     /// Physical timestamp component, in milliseconds since the Unix epoch.
-    pub timestamp: u64,
+    pub timestamp_ms: u64,
     /// Logical counter component, incremented for events within the same millisecond.
     pub version: u32,
     /// Unique identifier for the node that generated this HLC.
@@ -149,8 +71,32 @@ impl std::fmt::Display for HLC {
         write!(
             f,
             "{}-{:08x}-{}",
-            self.timestamp, self.version, self.node_id
+            self.timestamp_ms, self.version, self.node_id
         )
+    }
+}
+
+impl PartialEq for HLC {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp_ms == other.timestamp_ms
+            && self.version == other.version
+            && self.node_id == other.node_id
+    }
+}
+
+impl PartialOrd for HLC {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HLC {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        (self.timestamp_ms, self.version, self.node_id).cmp(&(
+            other.timestamp_ms,
+            other.version,
+            other.node_id,
+        ))
     }
 }
 
@@ -160,7 +106,7 @@ impl HLC {
     /// This is often used as a starting point or default value.
     pub fn new(node_id: Uuid) -> Self {
         HLC {
-            timestamp: 0,
+            timestamp_ms: 0,
             version: 0,
             node_id,
         }
@@ -179,7 +125,7 @@ impl HLC {
             .expect("Time went backwards")
             .as_millis() as u64;
 
-        let (timestamp, counter) = match current_timestamp.cmp(&last_hlc.timestamp) {
+        let (timestamp, counter) = match current_timestamp.cmp(&last_hlc.timestamp_ms) {
             Ordering::Greater => (current_timestamp, 0),
             Ordering::Equal => {
                 if last_hlc.version == u32::MAX {
@@ -193,15 +139,15 @@ impl HLC {
             }
             Ordering::Less => {
                 if last_hlc.version == u32::MAX {
-                    (last_hlc.timestamp + 1, 0)
+                    (last_hlc.timestamp_ms + 1, 0)
                 } else {
-                    (last_hlc.timestamp, last_hlc.version + 1)
+                    (last_hlc.timestamp_ms, last_hlc.version + 1)
                 }
             }
         };
 
         let new_hlc = HLC {
-            timestamp,
+            timestamp_ms: timestamp,
             version: counter,
             node_id: context.node_id,
         };
@@ -227,9 +173,33 @@ impl HLC {
         } else {
             // Overflow: Increment timestamp and reset version
             // We assume timestamp itself won't realistically overflow u64.
-            self.timestamp += 1;
+            self.timestamp_ms += 1;
             self.version = 0;
         }
+    }
+
+    /// Converts the HLC timestamp to RFC3339 format.
+    ///
+    /// Returns a string representation of the timestamp in RFC3339 format (ISO 8601).
+    /// The timestamp is interpreted as milliseconds since the Unix epoch.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sync::hlc::HLC;
+    /// use uuid::Uuid;
+    ///
+    /// let hlc = HLC {
+    ///     timestamp: 1640995200000, // 2022-01-01T00:00:00Z
+    ///     version: 1,
+    ///     node_id: Uuid::new_v4(),
+    /// };
+    /// assert_eq!(hlc.to_rfc3339(), "2022-01-01T00:00:00+00:00");
+    /// ```
+    pub fn to_rfc3339(&self) -> String {
+        DateTime::from_timestamp_millis(self.timestamp_ms as i64)
+            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
+            .to_rfc3339()
     }
 }
 
@@ -258,7 +228,7 @@ impl FromStr for HLC {
             .with_context(|| format!("Invalid node ID format in HLC: '{}'", parts[2]))?;
 
         Ok(HLC {
-            timestamp,
+            timestamp_ms: timestamp,
             version: counter,
             node_id,
         })
@@ -335,11 +305,9 @@ pub trait HLCRecord: Clone + Send + Sync + 'static {
 #[async_trait]
 pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
     /// Returns the SeaORM column definition for the HLC timestamp component.
-    /// Assumes this column stores a value comparable via RFC3339 strings (like DATETIME or TIMESTAMP).
     fn updated_at_time_column() -> Self::Column;
 
     /// Returns the SeaORM column definition for the HLC version/counter component.
-    /// Assumes this column stores an integer type (like INTEGER or BIGINT).
     fn updated_at_version_column() -> Self::Column;
 
     /// Returns the SeaORM column definition for the node ID.
@@ -350,75 +318,86 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
 
     /// Creates a SeaORM condition for records strictly greater than the given HLC.
     fn gt(hlc: &HLC) -> Result<Condition> {
-        let timestamp_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)
-            .with_context(|| format!("Failed to format GT timestamp for HLC {}", hlc))?;
+        let ts_str = hlc.to_rfc3339();
+        let ver_val = hlc.version as i32;
+        let nid_str = hlc.node_id.to_string();
 
         Ok(Condition::any()
-            .add(Self::updated_at_time_column().gt(timestamp_str.clone()))
+            // (ts > hlc.ts)
+            .add(Self::updated_at_time_column().gt(ts_str.clone()))
+            // OR (ts == hlc.ts AND ver > hlc.ver)
             .add(
-                Self::updated_at_time_column()
-                    .eq(timestamp_str)
-                    .and(Self::updated_at_version_column().gt(hlc.version as i32)), // Cast u32 to i32 if column is INTEGER
+                Condition::all()
+                    .add(Self::updated_at_time_column().eq(ts_str.clone()))
+                    .add(Self::updated_at_version_column().gt(ver_val)),
+            )
+            // OR (ts == hlc.ts AND ver == hlc.ver AND nid > hlc.nid)
+            .add(
+                Condition::all()
+                    .add(Self::updated_at_time_column().eq(ts_str))
+                    .add(Self::updated_at_version_column().eq(ver_val))
+                    .add(Self::updated_at_node_id_column().gt(nid_str)),
             ))
     }
 
     /// Creates a SeaORM condition for records less than the given HLC.
     fn lt(hlc: &HLC) -> Result<Condition> {
-        let timestamp_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)
-            .with_context(|| format!("Failed to format LT timestamp for HLC {}", hlc))?;
+        let ts_str = hlc.to_rfc3339();
+        let ver_val = hlc.version as i32;
+        let nid_str = hlc.node_id.to_string();
 
         Ok(Condition::any()
-            .add(Self::updated_at_time_column().lt(timestamp_str.clone()))
+            // (ts < hlc.ts)
+            .add(Self::updated_at_time_column().lt(ts_str.clone()))
+            // OR (ts == hlc.ts AND ver < hlc.ver)
             .add(
-                Self::updated_at_time_column()
-                    .eq(timestamp_str)
-                    .and(Self::updated_at_version_column().lt(hlc.version as i32)),
+                Condition::all()
+                    .add(Self::updated_at_time_column().eq(ts_str.clone()))
+                    .add(Self::updated_at_version_column().lt(ver_val)),
+            )
+            // OR (ts == hlc.ts AND ver == hlc.ver AND nid < hlc.nid)
+            .add(
+                Condition::all()
+                    .add(Self::updated_at_time_column().eq(ts_str))
+                    .add(Self::updated_at_version_column().eq(ver_val))
+                    .add(Self::updated_at_node_id_column().lt(nid_str)),
             ))
     }
 
     /// Creates a SeaORM condition for records greater than or equal to the given HLC.
     fn gte(hlc: &HLC) -> Result<Condition> {
-        let timestamp_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)
-            .with_context(|| format!("Failed to format GTE timestamp for HLC {}", hlc))?;
-
-        Ok(Condition::any()
-            .add(Self::updated_at_time_column().gt(timestamp_str.clone()))
-            .add(
-                Self::updated_at_time_column()
-                    .eq(timestamp_str)
-                    .and(Self::updated_at_version_column().gte(hlc.version as i32)),
-            ))
+        Ok(<Self as HLCModel>::lt(hlc)?.not())
     }
 
     /// Creates a SeaORM condition for records less than or equal to the given HLC.
     fn lte(hlc: &HLC) -> Result<Condition> {
-        let timestamp_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)
-            .with_context(|| format!("Failed to format LTE timestamp for HLC {}", hlc))?;
-
-        Ok(Condition::any()
-            .add(Self::updated_at_time_column().lt(timestamp_str.clone()))
-            .add(
-                Self::updated_at_time_column()
-                    .eq(timestamp_str)
-                    .and(Self::updated_at_version_column().lte(hlc.version as i32)),
-            ))
+        Ok(<Self as HLCModel>::gt(hlc)?.not())
     }
 
     /// Creates a SeaORM condition for records within the given HLC range (inclusive).
     fn between(start_hlc: &HLC, end_hlc: &HLC) -> Result<Condition> {
-        // Ensure start <= end for logical consistency, though DB might handle it.
         if start_hlc > end_hlc {
             bail!(
-                "Start HLC {} must be less than or equal to End HLC {} for between condition",
+                "Start HLC {} must be less than or equal to End HLC {}",
                 start_hlc,
                 end_hlc
             );
         }
 
-        // Use GTE for start and LTE for end
-        Ok(Condition::all()
-            .add(Self::gte(start_hlc)?)
-            .add(Self::lte(end_hlc)?))
+        if start_hlc == end_hlc {
+            // Handle the single HLC case explicitly
+            let ts_str = start_hlc.to_rfc3339();
+            return Ok(Condition::all()
+                .add(Self::updated_at_time_column().eq(ts_str))
+                .add(Self::updated_at_version_column().eq(start_hlc.version as i32))
+                .add(Self::updated_at_node_id_column().eq(start_hlc.node_id.to_string())));
+        }
+
+        // Handle the range case: >= start AND <= end
+        let start_cond = Self::gte(start_hlc)?;
+        let end_cond = Self::lte(end_hlc)?;
+
+        Ok(Condition::all().add(start_cond).add(end_cond))
     }
 
     /// Finds a single record by its unique_id (typically sync_id).
@@ -450,7 +429,7 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
 mod hlcmodel_tests {
     use crate::{
         chunking::tests::test_model_def::Entity,
-        hlc::{create_hlc, hlc_timestamp_millis_to_rfc3339, HLCModel, HLC},
+        hlc::{create_hlc, HLCModel, HLC},
     };
     use anyhow::Result;
     use sea_orm::{Condition, DbBackend, EntityTrait, QueryFilter, QueryTrait, Statement, Value};
@@ -519,7 +498,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_gt() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let expected_ts_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)?;
+        let expected_ts_str = hlc.to_rfc3339();
         let expected_version = hlc.version as i32;
 
         let condition = Entity::gt(&hlc)?;
@@ -549,7 +528,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_lt() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let expected_ts_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)?;
+        let expected_ts_str = hlc.to_rfc3339();
         let expected_version = hlc.version as i32;
 
         let condition = Entity::lt(&hlc)?;
@@ -577,7 +556,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_gte() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let expected_ts_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)?;
+        let expected_ts_str = hlc.to_rfc3339();
         let expected_version = hlc.version as i32;
 
         let condition = Entity::gte(&hlc)?;
@@ -605,7 +584,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_lte() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let expected_ts_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)?;
+        let expected_ts_str = hlc.to_rfc3339();
         let expected_version = hlc.version as i32;
 
         let condition = Entity::lte(&hlc)?;
@@ -634,8 +613,8 @@ mod hlcmodel_tests {
         let node_id = Uuid::new_v4();
         let start_hlc = create_hlc(1678886400000, 1, &node_id.to_string());
         let end_hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let start_ts_str = hlc_timestamp_millis_to_rfc3339(start_hlc.timestamp)?;
-        let end_ts_str = hlc_timestamp_millis_to_rfc3339(end_hlc.timestamp)?;
+        let start_ts_str = start_hlc.to_rfc3339();
+        let end_ts_str = end_hlc.to_rfc3339();
         let start_version = start_hlc.version as i32;
         let end_version = end_hlc.version as i32;
 
@@ -668,7 +647,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_between_same_hlc() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let ts_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp)?;
+        let ts_str = hlc.to_rfc3339();
         let version = hlc.version as i32;
 
         let condition = Entity::between(&hlc, &hlc)?;
@@ -712,7 +691,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_timestamp_conversion_error() {
         let node_id = Uuid::new_v4();
         let invalid_hlc = HLC {
-            timestamp: u64::MAX, // Known out-of-range value for chrono
+            timestamp_ms: u64::MAX, // Known out-of-range value for chrono
             version: 0,
             node_id,
         };
@@ -868,7 +847,7 @@ where
 #[cfg(test)]
 pub fn create_hlc(ts: u64, v: u32, node_id_str: &str) -> HLC {
     HLC {
-        timestamp: ts,
+        timestamp_ms: ts,
         version: v,
         node_id: Uuid::parse_str(node_id_str).unwrap(),
     }
@@ -883,12 +862,12 @@ mod hlc_increment_tests {
     fn test_hlc_increment_normal() {
         let node_id = Uuid::new_v4();
         let mut hlc = HLC {
-            timestamp: 1000,
+            timestamp_ms: 1000,
             version: 5,
             node_id,
         };
         hlc.increment();
-        assert_eq!(hlc.timestamp, 1000);
+        assert_eq!(hlc.timestamp_ms, 1000);
         assert_eq!(hlc.version, 6);
         assert_eq!(hlc.node_id, node_id);
     }
@@ -897,12 +876,12 @@ mod hlc_increment_tests {
     fn test_hlc_increment_version_max() {
         let node_id = Uuid::new_v4();
         let mut hlc = HLC {
-            timestamp: 1000,
+            timestamp_ms: 1000,
             version: u32::MAX - 1,
             node_id,
         };
         hlc.increment();
-        assert_eq!(hlc.timestamp, 1000);
+        assert_eq!(hlc.timestamp_ms, 1000);
         assert_eq!(hlc.version, u32::MAX);
         assert_eq!(hlc.node_id, node_id);
     }
@@ -911,13 +890,13 @@ mod hlc_increment_tests {
     fn test_hlc_increment_overflow() {
         let node_id = Uuid::new_v4();
         let mut hlc = HLC {
-            timestamp: 1000,
+            timestamp_ms: 1000,
             version: u32::MAX,
             node_id,
         };
         hlc.increment();
         assert_eq!(
-            hlc.timestamp, 1001,
+            hlc.timestamp_ms, 1001,
             "Timestamp should increment on version overflow"
         );
         assert_eq!(hlc.version, 0, "Version should reset to 0 on overflow");
@@ -928,24 +907,24 @@ mod hlc_increment_tests {
     fn test_hlc_increment_multiple_overflows() {
         let node_id = Uuid::new_v4();
         let mut hlc = HLC {
-            timestamp: 1000,
+            timestamp_ms: 1000,
             version: u32::MAX - 1,
             node_id,
         };
 
         // Increment to MAX
         hlc.increment();
-        assert_eq!(hlc.timestamp, 1000);
+        assert_eq!(hlc.timestamp_ms, 1000);
         assert_eq!(hlc.version, u32::MAX);
 
         // Increment causing overflow
         hlc.increment();
-        assert_eq!(hlc.timestamp, 1001);
+        assert_eq!(hlc.timestamp_ms, 1001);
         assert_eq!(hlc.version, 0);
 
         // Normal increment after overflow
         hlc.increment();
-        assert_eq!(hlc.timestamp, 1001);
+        assert_eq!(hlc.timestamp_ms, 1001);
         assert_eq!(hlc.version, 1);
     }
 }
@@ -978,15 +957,15 @@ mod hlc_generate_tests {
         let after_ts = get_current_millis(); // Timestamp might advance slightly during test
 
         assert!(
-            new_hlc.timestamp > initial_hlc.timestamp,
+            new_hlc.timestamp_ms > initial_hlc.timestamp_ms,
             "New timestamp should be greater"
         );
         assert!(
-            new_hlc.timestamp >= initial_ts + 5,
+            new_hlc.timestamp_ms >= initial_ts + 5,
             "New timestamp should be roughly current time"
         );
         assert!(
-            new_hlc.timestamp <= after_ts,
+            new_hlc.timestamp_ms <= after_ts,
             "New timestamp should be roughly current time"
         );
         assert_eq!(new_hlc.version, 0, "Counter should reset");
@@ -1007,7 +986,7 @@ mod hlc_generate_tests {
         let new_hlc = context.generate_hlc();
 
         // It's possible the millisecond ticked over between get_current_millis and generate()
-        if new_hlc.timestamp == initial_hlc.timestamp {
+        if new_hlc.timestamp_ms == initial_hlc.timestamp_ms {
             assert_eq!(
                 new_hlc.version,
                 initial_hlc.version + 1,
@@ -1016,7 +995,7 @@ mod hlc_generate_tests {
         } else {
             // If time advanced, counter should reset
             assert!(
-                new_hlc.timestamp > initial_hlc.timestamp,
+                new_hlc.timestamp_ms > initial_hlc.timestamp_ms,
                 "Timestamp advanced"
             );
             assert_eq!(
@@ -1039,7 +1018,7 @@ mod hlc_generate_tests {
         let new_hlc = context.generate_hlc();
 
         assert_eq!(
-            new_hlc.timestamp, initial_hlc.timestamp,
+            new_hlc.timestamp_ms, initial_hlc.timestamp_ms,
             "Timestamp should use the last HLC's timestamp during skew"
         );
         assert_eq!(
@@ -1061,7 +1040,7 @@ mod hlc_generate_tests {
             .as_millis() as u64;
         let initial_version = 5u32;
         let initial_hlc = HLC {
-            timestamp: current_ts,
+            timestamp_ms: current_ts,
             version: initial_version,
             node_id,
         };
@@ -1071,7 +1050,7 @@ mod hlc_generate_tests {
         let new_hlc = context.generate_hlc();
 
         // Check the Ordering::Equal case explicitly
-        if new_hlc.timestamp == initial_hlc.timestamp {
+        if new_hlc.timestamp_ms == initial_hlc.timestamp_ms {
             assert_eq!(
                 new_hlc.version,
                 initial_hlc.version + 1,
@@ -1080,7 +1059,7 @@ mod hlc_generate_tests {
         } else {
             // If time advanced, counter should reset (Ordering::Greater case)
             assert!(
-                new_hlc.timestamp > initial_hlc.timestamp,
+                new_hlc.timestamp_ms > initial_hlc.timestamp_ms,
                 "Timestamp advanced unexpectedly fast, test assumption failed or different code path taken."
             );
             assert_eq!(
@@ -1102,7 +1081,7 @@ mod hlc_generate_tests {
             .as_millis() as u64
             + 10000; // 10 seconds in the future
         let initial_hlc = HLC {
-            timestamp: future_ts,
+            timestamp_ms: future_ts,
             version: u32::MAX, // Set counter to MAX
             node_id,
         };
@@ -1113,8 +1092,8 @@ mod hlc_generate_tests {
         // Clock skew detected (Ordering::Less), counter was MAX.
         // Should increment timestamp and reset counter.
         assert_eq!(
-            new_hlc.timestamp,
-            initial_hlc.timestamp + 1, // Timestamp increments because counter overflowed
+            new_hlc.timestamp_ms,
+            initial_hlc.timestamp_ms + 1, // Timestamp increments because counter overflowed
             "Timestamp should increment due to counter overflow during skew"
         );
         assert_eq!(
@@ -1138,7 +1117,7 @@ mod hlc_generate_tests {
         let node_id = Uuid::new_v4();
         let current_ts = get_current_millis();
         let initial_hlc = HLC {
-            timestamp: current_ts,
+            timestamp_ms: current_ts,
             version: u32::MAX, // Set version to max
             node_id,
         };
@@ -1168,7 +1147,7 @@ mod hlc_from_str_tests {
         let hlc_string = format!("1234567890123-0000abcd-{}", node_id);
         let hlc = HLC::from_str(&hlc_string)?;
 
-        assert_eq!(hlc.timestamp, 1234567890123);
+        assert_eq!(hlc.timestamp_ms, 1234567890123);
         assert_eq!(hlc.version, 0xabcd);
         assert_eq!(hlc.node_id, node_id);
         Ok(())
