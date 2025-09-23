@@ -38,23 +38,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "26.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install the Rust dependencies
-        run: cargo install 'flutter_rust_bridge_codegen' rinf protoc-gen-prost
-
-      - name: Activate Protobuf
-        run: flutter pub global activate protoc_plugin
+        run: cargo install rinf_cli
 
       - name: Flutter pub get
         run: flutter pub get
 
       - name: Generate message files
-        run: rinf message
+        run: rinf gen
 
       - name: Format message files
         run: |
@@ -68,7 +59,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
   flutter-analyze:
-    name: Flutter analyze
+    name: Flutter Analyze
     runs-on: ubuntu-latest
 
     steps:
@@ -87,23 +78,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "26.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install the Rust dependencies
-        run: cargo install 'flutter_rust_bridge_codegen' rinf protoc-gen-prost
-
-      - name: Activate Protobuf
-        run: flutter pub global activate protoc_plugin
+        run: cargo install rinf_cli
 
       - name: Flutter pub get
         run: flutter pub get
 
       - name: Generate message files
-        run: rinf message
+        run: rinf gen
       
       - name: Analyze Flutter
         run: |

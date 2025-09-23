@@ -56,7 +56,7 @@ impl DeviceDiscovery {
         let self_fingerprint = device_info.fingerprint.clone();
         tokio::spawn(async move {
             if let Err(e) = listen_service.start_listening(Some(self_fingerprint)).await {
-                println!("Error in listen task: {}", e);
+                println!("Error in listen task: {e}");
             } else {
                 println!("Listening for devices...");
             }
@@ -68,7 +68,7 @@ impl DeviceDiscovery {
                 .start_announcements(device_info.clone(), Duration::from_secs(1), None)
                 .await
             {
-                println!("Failed to announce: {}", e);
+                println!("Failed to announce: {e}");
             } else {
                 println!("Announcing device with alias: {}", device_info.alias);
             }
@@ -99,12 +99,12 @@ impl DeviceDiscovery {
 
 fn generate_random_alias() -> String {
     let mut rng = rand::thread_rng();
-    format!("Device-{:04x}", rng.gen::<u16>())
+    format!("Device-{:04x}", rng.r#gen::<u16>())
 }
 
 fn generate_random_model() -> String {
     let mut rng = rand::thread_rng();
-    format!("Model-{:04x}", rng.gen::<u16>())
+    format!("Model-{:04x}", rng.r#gen::<u16>())
 }
 
 fn generate_random_port() -> u16 {

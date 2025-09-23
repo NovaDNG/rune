@@ -1,13 +1,15 @@
-use std::fs::File;
 use std::io::Write;
+use std::{fs::File, sync::Arc};
 
 use anyhow::Result;
 use clap::{Arg, Command};
+use fsio::FsIo;
 use tokio_util::sync::CancellationToken;
 
 use tag_editor::sampler::interval_sampler::IntervalSampler;
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     // Set up CLI arguments
     let matches = Command::new("Sampler CLI")
         .version("1.0")
@@ -48,18 +50,19 @@ fn main() -> Result<()> {
         Some(cancel_token.clone()),
     );
 
+    let fsio = Arc::new(FsIo::new());
     // Process the audio file
-    sampler.process()?;
+    sampler.process(&fsio)?;
 
     for (counter, event) in sampler.receiver.iter().enumerate() {
         // Create numbered output file names for both txt and pcm
-        let txt_file = format!("{}_{}.sample.log", output_file_base, counter);
+        let txt_file = format!("{output_file_base}_{counter}.sample.log");
         // You can use ` ffplay ./YOUR_FILE.pcm.log  -f s16le -ar 8000` to debug this
-        let pcm_file = format!("{}_{}.pcm.log", output_file_base, counter);
+        let pcm_file = format!("{output_file_base}_{counter}.pcm.log");
 
         // Log the output file paths
-        println!("Writing to text file: {}", txt_file);
-        println!("Writing to PCM file: {}", pcm_file);
+        println!("Writing to text file: {txt_file}");
+        println!("Writing to PCM file: {pcm_file}");
 
         // Write text file
         let mut text_file = File::create(&txt_file)?;

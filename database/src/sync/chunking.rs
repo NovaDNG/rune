@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -10,9 +10,9 @@ use axum::{
 use chrono::DateTime;
 use log::{debug, error, info, warn};
 use sea_orm::{
-    sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
-    EntityTrait, IntoActiveModel, Iterable, PrimaryKeyToColumn, PrimaryKeyTrait, QueryFilter,
-    TransactionTrait,
+    ActiveModelBehavior, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
+    EntityTrait, IntoActiveModel, Iterable, ModelTrait, PrimaryKeyToColumn, PrimaryKeyTrait,
+    QueryFilter, TransactionTrait, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use sync::chunking::{break_data_chunk, generate_data_chunks};
@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     entities::{
         albums, artists, genres, media_cover_art, media_file_albums, media_file_artists,
-        media_file_genres, media_files, sync_record,
+        media_file_fingerprint, media_file_genres, media_file_similarity, media_files, sync_record,
     },
     sync::utils::parse_hlc,
 };
@@ -30,7 +30,7 @@ use ::sync::{
     chunking::{ChunkingOptions, DataChunk, SubDataChunk},
     core::{RemoteRecordsWithPayload, SyncOperation},
     foreign_key::{ActiveModelWithForeignKeyOps, ForeignKeyResolver, ModelWithForeignKeyOps},
-    hlc::{HLCModel, HLCQuery, HLCRecord, SyncTaskContext, HLC},
+    hlc::{HLC, HLCModel, HLCQuery, HLCRecord, SyncTaskContext},
 };
 
 use super::foreign_keys::RuneForeignKeyResolver;
@@ -78,11 +78,11 @@ pub fn parse_optional_hlc_from_parts(
         (Some(timestamp_str), Some(version), Some(nid_str)) => {
             // Parse RFC3339 timestamp and convert to milliseconds
             let timestamp_ms = DateTime::parse_from_rfc3339(&timestamp_str)
-                .with_context(|| format!("Invalid RFC3339 timestamp: {}", timestamp_str))?
+                .with_context(|| format!("Invalid RFC3339 timestamp: {timestamp_str}"))?
                 .timestamp_millis() as u64;
 
             let node_id = Uuid::parse_str(&nid_str)
-                .with_context(|| format!("Invalid HLC node_id string: {}", nid_str))?;
+                .with_context(|| format!("Invalid HLC node_id string: {nid_str}"))?;
 
             Ok(Some(HLC {
                 timestamp_ms,
@@ -182,11 +182,20 @@ pub async fn get_remote_chunks_handler(
             )
             .await?
         }
+        "media_file_fingerprint" => {
+            generate_data_chunks::<media_file_fingerprint::Entity, _>(
+                db,
+                &options,
+                after_hlc,
+                Some(fk_resolver),
+            )
+            .await?
+        }
         _ => {
             return Err(AppError(anyhow!(
                 "Unsupported table name for chunks: {}",
                 table_name
-            )))
+            )));
         }
     };
     Ok(Json(chunks))
@@ -278,11 +287,20 @@ pub async fn get_remote_sub_chunks_handler(
             )
             .await?
         }
+        "media_file_fingerprint" => {
+            break_data_chunk::<media_file_fingerprint::Entity, _>(
+                db,
+                &payload.parent_chunk,
+                payload.sub_chunk_size,
+                Some(fk_resolver),
+            )
+            .await?
+        }
         _ => {
             return Err(AppError(anyhow!(
                 "Unsupported table name for sub_chunks: {}",
                 table_name
-            )))
+            )));
         }
     };
     let result_chunks: Vec<DataChunk> = sub_chunks_metadata.into_iter().map(|s| s.chunk).collect();
@@ -426,11 +444,29 @@ pub async fn get_remote_records_in_hlc_range_handler(
             )
             .await?,
         )?,
+        "media_file_fingerprint" => serde_json::to_value(
+            fetch_records_with_fk_payloads::<media_file_fingerprint::Entity, _>(
+                db,
+                &start_hlc,
+                &end_hlc,
+                fk_resolver,
+            )
+            .await?,
+        )?,
+        "media_file_similarity" => serde_json::to_value(
+            fetch_records_with_fk_payloads::<media_file_similarity::Entity, _>(
+                db,
+                &start_hlc,
+                &end_hlc,
+                fk_resolver,
+            )
+            .await?,
+        )?,
         _ => {
             return Err(AppError(anyhow!(
                 "Unsupported table name for records: {}",
                 table_name
-            )))
+            )));
         }
     };
     Ok(Json(response_json).into_response())
@@ -444,7 +480,7 @@ pub struct ApplyChangesPayload<Model: HLCRecord> {
 }
 
 /// Generic function to process sync operations for a given entity within a transaction.
-/// This is a corrected and robust implementation.
+/// This version includes extensive diagnostic logging.
 #[allow(clippy::needless_borrow)]
 async fn process_entity_changes<'a, E, FKR>(
     txn: &'a sea_orm::DatabaseTransaction,
@@ -455,97 +491,111 @@ async fn process_entity_changes<'a, E, FKR>(
 where
     E: HLCModel + EntityTrait + Send + Sync,
     E::PrimaryKey: PrimaryKeyTrait,
+    <E::PrimaryKey as PrimaryKeyTrait>::ValueType: Send + Debug,
     E::Model: HLCRecord
+        + ModelTrait
         + Send
         + Sync
         + for<'de> Deserialize<'de>
         + IntoActiveModel<E::ActiveModel>
-        + ModelWithForeignKeyOps,
-    E::ActiveModel: sea_orm::ActiveModelBehavior + Send + Sync + ActiveModelWithForeignKeyOps,
+        + ModelWithForeignKeyOps
+        + Debug
+        + Clone,
+    E::ActiveModel: ActiveModelBehavior + Send + Sync + ActiveModelWithForeignKeyOps,
     FKR: ForeignKeyResolver + Send + Sync,
 {
-    let payload: ApplyChangesPayload<E::Model> =
-        serde_json::from_slice(body).with_context(|| {
-            format!(
-                "Failed to deserialize full payload for table {}",
-                table_name
-            )
-        })?;
+    let payload: ApplyChangesPayload<E::Model> = serde_json::from_slice(body)
+        .with_context(|| format!("Failed to deserialize full payload for table {table_name}"))?;
 
     let mut operations_processed_count = 0;
 
     for op in &payload.operations {
         match op {
-            SyncOperation::InsertRemote(model, fk_payload) => {
-                let id_str = model.unique_id();
-                debug!("Server TXN: Inserting record with unique_id {}", id_str);
-                let mut active_model = model.clone().into_active_model();
-
-                // CRITICAL: Reset the primary key so the server's database can generate a new one.
-                // This is essential for preventing PK conflicts in a multi-client environment.
-                for pk_col in E::PrimaryKey::iter() {
-                    active_model.reset(pk_col.into_column());
-                }
-
-                fk_resolver
-                    .remap_and_set_foreign_keys(&mut active_model, &fk_payload, txn)
-                    .await?;
-
-                E::insert(active_model).exec(txn).await.with_context(|| {
-                    format!("Failed to insert server record with unique_id {}", id_str)
-                })?;
-
-                operations_processed_count += 1;
-            }
-            SyncOperation::UpdateRemote(model, fk_payload) => {
-                let id_str = model.unique_id();
-                debug!("Server TXN: Updating record with unique_id {}", id_str);
-                let mut active_model = model.clone().into_active_model();
-
-                for pk_col in E::PrimaryKey::iter() {
-                    active_model.reset(pk_col.into_column());
-                }
-
-                fk_resolver
-                    .remap_and_set_foreign_keys(&mut active_model, &fk_payload, txn)
-                    .await?;
-
-                let res = E::update_many()
-                    .set(active_model)
-                    .filter(E::unique_id_column().eq(id_str.clone()))
-                    .exec(txn)
-                    .await?;
-
-                if res.rows_affected > 0 {
-                    operations_processed_count += 1;
+            SyncOperation::InsertRemote(model, fk_payload)
+            | SyncOperation::UpdateRemote(model, fk_payload) => {
+                let op_type = if matches!(op, SyncOperation::InsertRemote(..)) {
+                    "InsertRemote"
                 } else {
-                    warn!(
-                        "Update operation for table {} with unique_id {} affected 0 rows.",
-                        table_name, id_str
+                    "UpdateRemote"
+                };
+                let unique_id = model.unique_id();
+
+                let existing_record = E::find()
+                    .filter(E::unique_id_column().eq(unique_id.clone()))
+                    .one(txn)
+                    .await?;
+
+                if let Some(db_record) = &existing_record
+                    && model.updated_at_hlc() <= db_record.updated_at_hlc()
+                {
+                    debug!(
+                        "[SERVER DIAGNOSTICS] Ignoring stale {op_type} for unique_id: {unique_id}"
                     );
+                    continue;
+                }
+
+                debug!("[SERVER DIAGNOSTICS] Processing {op_type} for unique_id: {unique_id}");
+
+                // Create an active model from the incoming model, where all fields will be `Set`.
+                let json_val = serde_json::to_value(model.clone())?;
+                let mut active_model = E::ActiveModel::from_json(json_val)?;
+
+                // Remap FKs before inserting or updating.
+                fk_resolver
+                    .remap_and_set_foreign_keys(&mut active_model, &fk_payload, txn)
+                    .await?;
+
+                if existing_record.is_some() {
+                    // Reset the primary key field(s) to `NotSet`.
+                    // This is crucial to prevent trying to `SET` the primary key column
+                    // during the update operation.
+                    for pk_col in E::PrimaryKey::iter() {
+                        active_model.reset(pk_col.into_column());
+                    }
+
+                    // Use `update_many` filtered by the logical unique_id.
+                    // This correctly applies only the `Set` fields from `active_model`.
+                    let res = E::update_many()
+                        .set(active_model)
+                        .filter(E::unique_id_column().eq(unique_id.clone()))
+                        .exec(txn)
+                        .await?;
+
+                    if res.rows_affected == 0 {
+                        // This indicates a problem, as we found an existing record but couldn't update it.
+                        return Err(anyhow!(
+                            "Record with unique_id {} was found but update affected 0 rows.",
+                            unique_id
+                        ));
+                    }
+                    operations_processed_count += res.rows_affected;
+                } else {
+                    // Reset the primary key to ensure the database generates a new one.
+                    for pk_col in E::PrimaryKey::iter() {
+                        active_model.reset(pk_col.into_column());
+                    }
+
+                    // Explicitly call insert.
+                    E::insert(active_model).exec_without_returning(txn).await?;
+                    operations_processed_count += 1;
                 }
             }
             SyncOperation::DeleteRemote(unique_id) => {
-                debug!("Server TXN: Deleting record with unique_id {}", unique_id);
                 let res = E::delete_many()
                     .filter(E::unique_id_column().eq(unique_id.clone()))
                     .exec(txn)
                     .await?;
-
                 if res.rows_affected > 0 {
                     operations_processed_count += 1;
                 } else {
                     warn!(
-                        "Delete operation for table {}: Record with unique_id {} not found.",
-                        table_name, unique_id
+                        "Delete operation for table {table_name}: Record with unique_id {unique_id} not found."
                     );
                 }
             }
-            // Other operations received from a client are unexpected but should be ignored gracefully.
             op => {
                 debug!(
-                    "Server received a non-standard or no-op client operation, ignoring: {:?}",
-                    op
+                    "Server received a non-standard or no-op client operation, ignoring: {op:?}"
                 );
             }
         }
@@ -564,7 +614,7 @@ pub async fn apply_remote_changes_handler(
     Path(table_name): Path<String>,
     body: Bytes,
 ) -> Result<Json<HLC>, AppError> {
-    println!(
+    info!(
         "[SERVER] Request: apply_remote_changes for table '{}' with body: {}",
         table_name,
         String::from_utf8_lossy(&body)
@@ -574,10 +624,7 @@ pub async fn apply_remote_changes_handler(
     let fk_resolver = state.fk_resolver.as_ref();
 
     let txn = db.begin().await.context("Failed to begin transaction")?;
-    debug!(
-        "Transaction started for apply_remote_changes on table {}",
-        table_name
-    );
+    debug!("Transaction started for apply_remote_changes on table {table_name}");
 
     let (operations_processed_count, client_node_id, new_last_sync_hlc) = match table_name.as_str()
     {
@@ -633,6 +680,15 @@ pub async fn apply_remote_changes_handler(
             )
             .await?
         }
+        "media_file_fingerprint" => {
+            process_entity_changes::<media_file_fingerprint::Entity, _>(
+                &txn,
+                &body,
+                fk_resolver,
+                &table_name,
+            )
+            .await?
+        }
         _ => {
             txn.rollback()
                 .await
@@ -645,13 +701,12 @@ pub async fn apply_remote_changes_handler(
     };
 
     debug!(
-        "Processed {} operations for table '{}'. Upserting sync_record for client {} with HLC {}.",
-        operations_processed_count, table_name, client_node_id, new_last_sync_hlc
+        "Processed {operations_processed_count} operations for table '{table_name}'. Upserting sync_record for client {client_node_id} with HLC {new_last_sync_hlc}."
     );
     let sync_record_model = sync_record::ActiveModel {
         table_name: Set(table_name.clone()),
         client_node_id: Set(client_node_id.to_string()),
-        last_sync_hlc_ts: Set(new_last_sync_hlc.to_rfc3339()),
+        last_sync_hlc_ts: Set(new_last_sync_hlc.to_rfc3339()?),
         last_sync_hlc_ver: Set(new_last_sync_hlc.version as i32),
         last_sync_hlc_nid: Set(new_last_sync_hlc.node_id.to_string()),
         ..Default::default()
@@ -675,17 +730,12 @@ pub async fn apply_remote_changes_handler(
         .context("Failed to upsert sync_record")?;
 
     txn.commit().await.context("Failed to commit transaction")?;
-    debug!(
-        "Transaction committed for apply_remote_changes on table {}",
-        table_name
-    );
+    debug!("Transaction committed for apply_remote_changes on table {table_name}");
 
-    let result_hlc = state.hlc_context.generate_hlc();
     info!(
-        "apply_remote_changes for table '{}' completed. Effective HLC: {}",
-        table_name, result_hlc
+        "apply_remote_changes for table '{table_name}' completed. Effective HLC: {new_last_sync_hlc}"
     );
-    Ok(Json(result_hlc))
+    Ok(Json(new_last_sync_hlc))
 }
 
 /// Fetches the remote's perspective of the last sync HLC with the local node.
@@ -694,8 +744,7 @@ pub async fn get_remote_last_sync_hlc_handler(
     Path((table_name, client_node_id_str)): Path<(String, String)>,
 ) -> Result<Json<Option<HLC>>, AppError> {
     info!(
-        "Request: get_remote_last_sync_hlc for table '{}', client_node_id: {}",
-        table_name, client_node_id_str
+        "Request: get_remote_last_sync_hlc for table '{table_name}', client_node_id: {client_node_id_str}"
     );
 
     let client_node_id = Uuid::parse_str(&client_node_id_str)?;

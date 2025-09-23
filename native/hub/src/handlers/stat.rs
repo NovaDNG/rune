@@ -9,9 +9,9 @@ use ::database::{
 use ::playback::player::PlayingItem;
 
 use crate::{
+    Session, Signal,
     messages::*,
     utils::{GlobalParams, ParamsExtractor},
-    Session, Signal,
 };
 
 impl ParamsExtractor for SetLikedRequest {
@@ -49,18 +49,19 @@ impl Signal for SetLikedRequest {
                         })?;
 
                     SetLikedResponse {
-                        item: Some(item.clone()),
+                        item: item.clone(),
                         liked: request.liked,
                         success: true,
                     }
                 }
                 PlayingItem::IndependentFile(_) => SetLikedResponse {
-                    item: Some(item.clone()),
+                    item: item.clone(),
                     liked: false,
                     success: false,
                 },
+                PlayingItem::Online(_, _) => todo!(),
                 PlayingItem::Unknown => SetLikedResponse {
-                    item: Some(item.clone()),
+                    item: item.clone(),
                     liked: false,
                     success: false,
                 },
@@ -100,19 +101,20 @@ impl Signal for GetLikedRequest {
                 PlayingItem::InLibrary(file_id) => {
                     let liked = get_liked(&main_db, file_id)
                         .await
-                        .with_context(|| format!("Failed to get liked: file_id={}", file_id))?;
+                        .with_context(|| format!("Failed to get liked: file_id={file_id}"))?;
 
                     GetLikedResponse {
-                        item: Some(item.clone()),
+                        item: item.clone(),
                         liked,
                     }
                 }
                 PlayingItem::IndependentFile(_) => GetLikedResponse {
-                    item: Some(item.clone()),
+                    item: item.clone(),
                     liked: false,
                 },
+                PlayingItem::Online(_, _) => todo!(),
                 PlayingItem::Unknown => GetLikedResponse {
-                    item: Some(item.clone()),
+                    item: item.clone(),
                     liked: false,
                 },
             };

@@ -1,13 +1,12 @@
-use std::collections::HashMap;
-use std::env;
-use std::fs;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use dunce::canonicalize;
 use log::info;
 use once_cell::sync::Lazy;
 use sea_orm::{
@@ -16,8 +15,8 @@ use sea_orm::{
 };
 use tokio_util::sync::CancellationToken;
 
-use metadata::cover_art::get_primary_color;
-use metadata::cover_art::{extract_cover_art_binary, CoverArt};
+use ::fsio::FsIo;
+use ::metadata::cover_art::{CoverArt, extract_cover_art_binary, get_primary_color};
 use uuid::Uuid;
 
 use crate::{
@@ -55,7 +54,7 @@ pub async fn ensure_magic_cover_art(
             file_hash: ActiveValue::Set(String::new()),
             binary: ActiveValue::Set(Vec::new()),
             primary_color: ActiveValue::Set(Some(0)),
-            hlc_uuid: ActiveValue::Set(Uuid::new_v4().to_string()),
+            hlc_uuid: ActiveValue::Set("00000000-0000-0000-0000-000000000000".to_owned()),
             created_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
             updated_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
             created_at_hlc_ver: ActiveValue::Set(0),
@@ -88,11 +87,12 @@ pub static COVER_TEMP_DIR: Lazy<PathBuf> =
     Lazy::new(|| env::temp_dir().join("rune").join("cover_arts"));
 
 fn bake_cover_art_by_cover_arts(
+    fsio: &FsIo,
     cover_arts: Vec<media_cover_art::Model>,
 ) -> Result<HashMap<i32, String>> {
     let mut cover_art_id_to_path: HashMap<i32, String> = HashMap::new();
 
-    fs::create_dir_all(COVER_TEMP_DIR.clone())?;
+    fsio.create_dir_all(&COVER_TEMP_DIR)?;
 
     for cover_art in cover_arts.iter() {
         let id: i32 = cover_art.id;
@@ -115,6 +115,7 @@ fn bake_cover_art_by_cover_arts(
 }
 
 pub async fn bake_cover_art_by_cover_art_ids(
+    fsio: &FsIo,
     main_db: &DatabaseConnection,
     cover_art_ids: Vec<i32>,
 ) -> Result<HashMap<i32, String>> {
@@ -123,10 +124,11 @@ pub async fn bake_cover_art_by_cover_art_ids(
         .all(main_db)
         .await?;
 
-    bake_cover_art_by_cover_arts(cover_arts)
+    bake_cover_art_by_cover_arts(fsio, cover_arts)
 }
 
 pub async fn bake_cover_art_by_media_files(
+    fsio: &FsIo,
     main_db: &DatabaseConnection,
     files: Vec<media_files::Model>,
 ) -> Result<HashMap<i32, String>> {
@@ -136,7 +138,8 @@ pub async fn bake_cover_art_by_media_files(
         .map(|x| x.cover_art_id.unwrap_or(-1))
         .collect();
 
-    let cover_art_id_to_path = bake_cover_art_by_cover_art_ids(main_db, cover_art_ids).await?;
+    let cover_art_id_to_path =
+        bake_cover_art_by_cover_art_ids(fsio, main_db, cover_art_ids).await?;
 
     let mut file_id_to_path: HashMap<i32, String> = HashMap::new();
 
@@ -155,6 +158,7 @@ pub async fn bake_cover_art_by_media_files(
 }
 
 pub async fn bake_cover_art_by_file_ids(
+    fsio: &FsIo,
     main_db: &DatabaseConnection,
     file_ids: Vec<i32>,
 ) -> Result<HashMap<i32, String>> {
@@ -180,22 +184,20 @@ pub async fn bake_cover_art_by_file_ids(
         }
     };
 
-    bake_cover_art_by_media_files(main_db, files).await
+    bake_cover_art_by_media_files(fsio, main_db, files).await
 }
 
 pub fn extract_cover_art_by_file_id(
-    file: &media_files::Model,
+    fsio: &FsIo,
     lib_path: &Path,
+    file: &media_files::Model,
 ) -> Option<CoverArt> {
-    let file_path = canonicalize(
-        Path::new(lib_path)
-            .join(file.directory.clone())
-            .join(file.file_name.clone()),
-    )
-    .unwrap();
+    let file_path = Path::new(lib_path)
+        .join(file.directory.clone())
+        .join(file.file_name.clone());
 
     // If cover_art_id is empty, it means the file has not been checked before
-    extract_cover_art_binary(&file_path, Some(lib_path))
+    extract_cover_art_binary(fsio, Some(lib_path), &file_path)
 }
 
 pub async fn insert_extract_result(
@@ -203,6 +205,7 @@ pub async fn insert_extract_result(
     file: &media_files::Model,
     magic_cover_art_id: i32,
     result: Option<CoverArt>,
+    node_id: &str,
 ) -> Result<()> {
     let file = file.clone();
     if let Some(cover_art) = result {
@@ -228,13 +231,15 @@ pub async fn insert_extract_result(
                 file_hash: ActiveValue::Set(cover_art.crc.clone()),
                 binary: ActiveValue::Set(cover_art.data.clone()),
                 primary_color: ActiveValue::Set(Some(cover_art.primary_color)),
-                hlc_uuid: ActiveValue::Set(Uuid::new_v4().to_string()),
+                hlc_uuid: ActiveValue::Set(
+                    Uuid::new_v5(&Uuid::NAMESPACE_OID, cover_art.crc.as_bytes()).to_string(),
+                ),
                 created_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
                 updated_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
                 created_at_hlc_ver: ActiveValue::Set(0),
                 updated_at_hlc_ver: ActiveValue::Set(0),
-                created_at_hlc_nid: ActiveValue::Set("".to_owned()),
-                updated_at_hlc_nid: ActiveValue::Set("".to_owned()),
+                created_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
+                updated_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
             };
 
             let insert_result = media_cover_art::Entity::insert(new_cover_art)
@@ -263,6 +268,7 @@ pub async fn insert_extract_result(
 }
 
 pub async fn scan_cover_arts<F>(
+    fsio: Arc<FsIo>,
     main_db: &DatabaseConnection,
     lib_path: &Path,
     node_id: &str,
@@ -273,17 +279,16 @@ pub async fn scan_cover_arts<F>(
 where
     F: Fn(usize, usize) + Send + Sync + 'static,
 {
-    info!(
-        "Starting cover art processing with batch size: {}",
-        batch_size
-    );
+    info!("Starting cover art processing with batch size: {batch_size}");
 
     let progress_callback = Arc::new(progress_callback);
 
     let cursor_query = media_files::Entity::find();
 
-    let lib_path = Arc::new(lib_path.to_path_buf());
     let magic_cover_art_id = ensure_magic_cover_art_id(main_db, node_id).await?;
+
+    let lib_path = Arc::new(lib_path.to_path_buf());
+    let node_id = Arc::new(node_id.to_owned());
 
     parallel_media_files_processing!(
         main_db,
@@ -292,9 +297,13 @@ where
         cancel_token,
         cursor_query,
         lib_path,
-        move |file, lib_path, _cancel_token| { extract_cover_art_by_file_id(file, lib_path) },
-        |db, file: media_files::Model, result| async move {
-            match insert_extract_result(db, &file, magic_cover_art_id, result).await {
+        fsio,
+        node_id,
+        move |fsio, file, lib_path, _cancel_token| {
+            extract_cover_art_by_file_id(fsio, lib_path, file)
+        },
+        |db, file: media_files::Model, node_id: Arc<String>, result| async move {
+            match insert_extract_result(db, &file, magic_cover_art_id, result, &node_id).await {
                 Ok(_) => {
                     debug!("Processed cover art for file ID: {}", file.id);
                 }
@@ -318,27 +327,27 @@ where
         .one(main_db)
         .await?;
 
-    if let Some(file) = file {
-        if let Some(cover_art_id) = file.cover_art_id {
-            // Update the file's cover_art_id to None
-            let mut file_active_model: media_files::ActiveModel = file.into();
-            file_active_model.cover_art_id = ActiveValue::Set(None);
-            media_files::Entity::update(file_active_model)
+    if let Some(file) = file
+        && let Some(cover_art_id) = file.cover_art_id
+    {
+        // Update the file's cover_art_id to None
+        let mut file_active_model: media_files::ActiveModel = file.into();
+        file_active_model.cover_art_id = ActiveValue::Set(None);
+        media_files::Entity::update(file_active_model)
+            .exec(main_db)
+            .await?;
+
+        // Check if there are other files linked to the same cover_art_id
+        let count = media_files::Entity::find()
+            .filter(media_files::Column::CoverArtId.eq(cover_art_id))
+            .count(main_db)
+            .await?;
+
+        if count == 0 {
+            // If no other files are linked to the same cover_art_id, delete the corresponding entry in the media_cover_art table
+            media_cover_art::Entity::delete_by_id(cover_art_id)
                 .exec(main_db)
                 .await?;
-
-            // Check if there are other files linked to the same cover_art_id
-            let count = media_files::Entity::find()
-                .filter(media_files::Column::CoverArtId.eq(cover_art_id))
-                .count(main_db)
-                .await?;
-
-            if count == 0 {
-                // If no other files are linked to the same cover_art_id, delete the corresponding entry in the media_cover_art table
-                media_cover_art::Entity::delete_by_id(cover_art_id)
-                    .exec(main_db)
-                    .await?;
-            }
         }
     }
 

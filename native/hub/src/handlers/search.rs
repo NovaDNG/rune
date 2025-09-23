@@ -8,9 +8,9 @@ use ::database::actions::search::search_for;
 use ::database::connection::MainDbConnection;
 
 use crate::{
+    Session, Signal,
     messages::*,
     utils::{GlobalParams, ParamsExtractor},
-    Session, Signal,
 };
 
 impl ParamsExtractor for SearchForRequest {
@@ -47,7 +47,7 @@ impl Signal for SearchForRequest {
             n,
         )
         .await
-        .with_context(|| format!("Search request failed: query_str={}, n={}", query_str, n))?;
+        .with_context(|| format!("Search request failed: query_str={query_str}, n={n}"))?;
 
         let mut artists: Vec<i32> = Vec::new();
         let mut albums: Vec<i32> = Vec::new();

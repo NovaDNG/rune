@@ -51,10 +51,11 @@ impl SfxPlayerInternal {
                 break;
             }
 
-            if let Some(sink) = &self.sink {
-                if sink.empty() && self.state == InternalSfxPlaybackState::Playing {
-                    self.state = InternalSfxPlaybackState::Empty;
-                }
+            if let Some(sink) = &self.sink
+                && sink.empty()
+                && self.state == InternalSfxPlaybackState::Playing
+            {
+                self.state = InternalSfxPlaybackState::Empty;
             }
 
             if let Some(cmd) = self.commands.recv().await {
@@ -66,7 +67,7 @@ impl SfxPlayerInternal {
                     break;
                 }
 
-                debug!("Received command: {:?}", cmd);
+                debug!("Received command: {cmd:?}");
                 match cmd {
                     SfxPlayerCommand::Load { path } => self.load(Some(path)),
                     SfxPlayerCommand::SetVolume(volume) => self.set_volume(volume),
@@ -101,7 +102,7 @@ impl SfxPlayerInternal {
             self._stream = Some(stream);
             self.current_track_path = Some(path.clone());
             self.state = InternalSfxPlaybackState::Playing;
-            info!("SFX track loaded and playing: {:?}", path);
+            info!("SFX track loaded and playing: {path:?}");
         } else {
             error!("Load command received without index");
         }

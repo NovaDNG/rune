@@ -4,9 +4,12 @@ mod gui_request;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use fsio::FsIo;
 use log::{error, info};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
+
+use rinf::{DartSignal, RustSignal};
 
 pub use tokio;
 
@@ -18,19 +21,20 @@ use ::playback::player::Player;
 use ::playback::sfx_player::SfxPlayer;
 use ::scrobbling::manager::ScrobblingManager;
 
+use crate::Signal;
 use crate::listen_local_gui_event;
 use crate::messages::*;
 use crate::server::ServerManager;
-use crate::utils::nid::get_or_create_node_id;
-use crate::utils::player::initialize_local_player;
 use crate::utils::Broadcaster;
 use crate::utils::DatabaseConnections;
 use crate::utils::GlobalParams;
 use crate::utils::ParamsExtractor;
 use crate::utils::TaskTokens;
-use crate::Signal;
+use crate::utils::nid::get_or_create_node_id;
+use crate::utils::player::initialize_local_player;
 
 pub async fn local_player_loop(
+    fsio: Arc<FsIo>,
     lib_path: String,
     config_path: String,
     db_connections: DatabaseConnections,
@@ -50,7 +54,7 @@ pub async fn local_player_loop(
         let config_path: Arc<String> = Arc::new(config_path);
 
         let node_id = Arc::new(
-            get_or_create_node_id(&config_path)
+            get_or_create_node_id(&fsio, &config_path)
                 .await
                 .unwrap()
                 .to_string(),
@@ -77,6 +81,7 @@ pub async fn local_player_loop(
 
         info!("Initializing Player events");
         tokio::spawn(initialize_local_player(
+            fsio.clone(),
             lib_path.clone(),
             main_db.clone(),
             player.clone(),
@@ -88,6 +93,7 @@ pub async fn local_player_loop(
 
         info!("Initializing UI events");
         let global_params = GlobalParams {
+            fsio,
             lib_path,
             config_path,
             node_id,

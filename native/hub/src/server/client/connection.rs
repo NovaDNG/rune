@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::{collections::HashMap, process::exit};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
 use log::error;
-use prost::Message as ProstMessage;
-use tokio::sync::{mpsc, RwLock};
+use rinf::{DartSignal, RustSignal};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite};
 use tungstenite::Message;
 use uuid::Uuid;
@@ -33,7 +34,7 @@ impl WSConnection {
             while let Some((type_name, payload, uuid)) = rx.recv().await {
                 let message = encode_message(&type_name, &payload, Some(uuid));
                 if let Err(e) = write.send(Message::Binary(message.into())).await {
-                    eprintln!("Failed to send message: {}", e);
+                    eprintln!("Failed to send message: {e}");
                     break;
                 }
             }
@@ -53,7 +54,7 @@ impl WSConnection {
                     }
                     Ok(Message::Close(_)) => break,
                     Err(e) => {
-                        error!("Error receiving message: {}", e);
+                        error!("Error receiving message: {e}");
                         exit(0);
                     }
                     _ => {}
@@ -67,7 +68,7 @@ impl WSConnection {
         })
     }
 
-    pub async fn request<T: ProstMessage, U: ProstMessage + Default>(
+    pub async fn request<T: DartSignal + Serialize, U: RustSignal + for<'a> Deserialize<'a>>(
         &self,
         type_name: &str,
         request: T,
@@ -80,14 +81,14 @@ impl WSConnection {
             channels.insert(uuid, response_tx);
         }
 
-        let payload = request.encode_to_vec();
+        let payload = rinf::serialize(&request).with_context(|| "Failed to serialize request")?;
         self.tx.send((type_name.to_string(), payload, uuid)).await?;
 
         let response = response_rx
             .recv()
             .await
             .ok_or_else(|| anyhow!("No response received"))?;
-        let decoded = U::decode(&response[..])?;
+        let decoded = rinf::deserialize::<U>(&response[..])?;
 
         {
             let mut channels = self.response_channels.write().await;
@@ -97,7 +98,11 @@ impl WSConnection {
         Ok(decoded)
     }
 
-    pub async fn request_simple<T: ProstMessage>(&self, type_name: &str, request: T) -> Result<()> {
+    pub async fn request_simple<T: DartSignal + Serialize>(
+        &self,
+        type_name: &str,
+        request: T,
+    ) -> Result<()> {
         let (response_tx, _) = mpsc::channel(1);
         let uuid = Uuid::new_v4();
 
@@ -106,7 +111,7 @@ impl WSConnection {
             channels.insert(uuid, response_tx);
         }
 
-        let payload = request.encode_to_vec();
+        let payload = rinf::serialize(&request).with_context(|| "Failed to serialize request")?;
         self.tx.send((type_name.to_string(), payload, uuid)).await?;
 
         Ok(())

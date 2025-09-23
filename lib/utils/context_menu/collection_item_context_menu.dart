@@ -2,9 +2,10 @@ import 'dart:io';
 
 import 'package:provider/provider.dart';
 import 'package:fluent_ui/fluent_ui.dart';
-import 'package:file_selector/file_selector.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:material_symbols_icons/symbols.dart';
+import 'package:fast_file_picker/fast_file_picker.dart';
+import 'package:file_selector/file_selector.dart' show XTypeGroup;
 
 import '../../utils/api/get_all_mixes.dart';
 import '../../utils/api/add_item_to_mix.dart';
@@ -13,8 +14,7 @@ import '../../utils/dialogs/mix/create_edit_mix.dart';
 import '../../utils/dialogs/mix/remove_mix_dialog.dart';
 import '../../utils/dialogs/playlist/create_edit_playlist.dart';
 import '../../utils/dialogs/playlist/remove_playlist_dialog.dart';
-import '../../messages/mix.pbserver.dart';
-import '../../messages/collection.pb.dart';
+import '../../bindings/bindings.dart';
 import '../../providers/responsive_providers.dart';
 import '../../utils/l10n.dart';
 
@@ -26,29 +26,34 @@ import '../router/router_aware_flyout_controller.dart';
 import 'utils/build_m3u8.dart';
 
 final Map<CollectionType, String> typeToOperator = {
-  CollectionType.Album: "lib::album",
-  CollectionType.Artist: "lib::artist",
-  CollectionType.Playlist: "lib::playlist",
-  CollectionType.Track: "lib::track",
-  CollectionType.Genre: "lib::genre",
+  CollectionType.album: "lib::album",
+  CollectionType.artist: "lib::artist",
+  CollectionType.playlist: "lib::playlist",
+  CollectionType.track: "lib::track",
+  CollectionType.genre: "lib::genre",
 };
 
 final Map<
-    CollectionType,
-    Future<void> Function(
-      BuildContext context,
-      void Function()? refreshList,
-      int id,
-    )> typeToEdit = {
-  CollectionType.Playlist: (context, refreshList, id) async {
-    final result =
-        await showCreateEditPlaylistDialog(context, "", playlistId: id);
+  CollectionType,
+  Future<void> Function(
+    BuildContext context,
+    void Function()? refreshList,
+    int id,
+  )
+>
+typeToEdit = {
+  CollectionType.playlist: (context, refreshList, id) async {
+    final result = await showCreateEditPlaylistDialog(
+      context,
+      "",
+      playlistId: id,
+    );
 
     if (result != null && refreshList != null) {
       refreshList();
     }
   },
-  CollectionType.Mix: (context, refreshList, id) async {
+  CollectionType.mix: (context, refreshList, id) async {
     final result = await showMixStudioDialog(context, mixId: id);
 
     if (result != null && refreshList != null) {
@@ -58,25 +63,27 @@ final Map<
 };
 
 Map<CollectionType, String> typeToEditLabel(BuildContext context) => {
-      CollectionType.Playlist: S.of(context).editPlaylist,
-      CollectionType.Mix: S.of(context).editMix,
-    };
+  CollectionType.playlist: S.of(context).editPlaylist,
+  CollectionType.mix: S.of(context).editMix,
+};
 
 final Map<
-    CollectionType,
-    Future<void> Function(
-      BuildContext context,
-      void Function()? refreshList,
-      int id,
-    )> typeToRemove = {
-  CollectionType.Playlist: (context, refreshList, id) async {
+  CollectionType,
+  Future<void> Function(
+    BuildContext context,
+    void Function()? refreshList,
+    int id,
+  )
+>
+typeToRemove = {
+  CollectionType.playlist: (context, refreshList, id) async {
     final result = await showRemovePlaylistDialog(context, id);
 
     if (result == true && refreshList != null) {
       refreshList();
     }
   },
-  CollectionType.Mix: (context, refreshList, id) async {
+  CollectionType.mix: (context, refreshList, id) async {
     final result = await showRemoveMixDialog(context, id);
 
     if (result == true && refreshList != null) {
@@ -86,9 +93,9 @@ final Map<
 };
 
 Map<CollectionType, String> typeToRemoveLabel(BuildContext context) => {
-      CollectionType.Playlist: S.of(context).removePlaylist,
-      CollectionType.Mix: S.of(context).removeMix,
-    };
+  CollectionType.playlist: S.of(context).removePlaylist,
+  CollectionType.mix: S.of(context).removeMix,
+};
 
 void openCollectionItemContextMenu(
   Offset localPosition,
@@ -165,17 +172,14 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
   final edit = typeToEdit[type];
   final remove = typeToRemove[type];
 
-  final List<MenuFlyoutItem> mixItems =
-      mixes.where((x) => !x.locked).map((mix) {
+  final List<MenuFlyoutItem> mixItems = mixes.where((x) => !x.locked).map((
+    mix,
+  ) {
     return MenuFlyoutItem(
       leading: const Icon(Symbols.magic_button),
       text: Text(mix.name),
       onPressed: () {
-        addItemToMix(
-          mix.id,
-          operator ?? "lib::unknown",
-          id.toString(),
-        );
+        addItemToMix(mix.id, operator ?? "lib::unknown", id.toString());
 
         Flyout.of(context).close();
       },
@@ -257,7 +261,7 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
             },
           ),
           if (mixItems.isNotEmpty) const MenuFlyoutSeparator(),
-          ...mixItems
+          ...mixItems,
         ],
       ),
     );
@@ -279,14 +283,11 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
               final Directory appDocumentsDir =
                   await getApplicationDocumentsDirectory();
 
-              final FileSaveLocation? path = await getSaveLocation(
+              final String? path = await FastFilePicker.pickSaveFile(
                 suggestedName: '$title.m3u8',
                 initialDirectory: appDocumentsDir.path,
                 acceptedTypeGroups: const [
-                  XTypeGroup(
-                    label: 'playlist',
-                    extensions: <String>['m3u8'],
-                  )
+                  XTypeGroup(label: 'playlist', extensions: <String>['m3u8']),
                 ],
               );
 
@@ -294,7 +295,7 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
 
               final playlist = await buildM3u8(type, id);
 
-              final file = File(path.path);
+              final file = File(path);
               await file.writeAsString(playlist);
             },
           ),
@@ -313,9 +314,7 @@ MenuFlyout buildLargeScreenCollectionItemContextMenu(
     );
   }
 
-  return MenuFlyout(
-    items: items,
-  );
+  return MenuFlyout(items: items);
 }
 
 FlyoutContent buildBandScreenCollectionItemContextMenu(

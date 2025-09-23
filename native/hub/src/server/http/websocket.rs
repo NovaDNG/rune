@@ -2,8 +2,8 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{
-        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         ConnectInfo, Query, State,
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -13,9 +13,9 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::{
+    Session,
     backends::remote::{decode_message, encode_message},
     server::ServerState,
-    Session,
 };
 use discovery::server::{User, UserStatus};
 
@@ -74,7 +74,7 @@ pub async fn websocket_handler(
     match auth_result {
         Ok(user) => {
             info!("Connection authorized for {} @ {}", user.alias, addr);
-            let host = format!("https://{}:7863", host);
+            let host = format!("https://{host}:7863");
             ws.on_upgrade(move |socket| handle_socket(socket, state, user, host))
         }
         Err(code) => {
@@ -99,14 +99,14 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, user: Use
     let alias = user.alias.clone();
     let fingerprint = user.fingerprint.clone();
 
-    info!("[{}] WebSocket connection established", alias);
+    info!("[{alias}] WebSocket connection established");
 
     // Clone alias for send_task
     let send_task_alias = alias.clone();
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let Err(e) = sender.send(msg).await {
-                error!("[{}] Failed to send message: {}", send_task_alias, e);
+                error!("[{send_task_alias}] Failed to send message: {e}");
                 break;
             }
         }
@@ -117,30 +117,38 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, user: Use
     let incoming_alias = alias.clone();
     let incoming = async move {
         while let Some(Ok(msg)) = receiver.next().await {
-            if let WsMessage::Binary(payload) = msg {
-                if let Some((msg_type, msg_payload, uuid)) = decode_message(&payload) {
-                    debug!("[{}] Received: {}", incoming_alias, msg_type);
+            if let WsMessage::Binary(payload) = msg
+                && let Some((msg_type, msg_payload, uuid)) = decode_message(&payload)
+            {
+                debug!("[{incoming_alias}] Received: {msg_type}");
 
-                    if let Some((resp_type, response)) = state
-                        .websocket_service
-                        .handle_message(
-                            &msg_type,
-                            msg_payload,
-                            Some(Session {
-                                fingerprint: fingerprint.to_owned(),
-                                host: host.to_owned(),
-                            }),
-                        )
+                if let Some((resp_type, response)) = state
+                    .websocket_service
+                    .handle_message(
+                        &msg_type,
+                        msg_payload,
+                        Some(Session {
+                            fingerprint: fingerprint.to_owned(),
+                            host: host.to_owned(),
+                        }),
+                    )
+                    .await
+                {
+                    let response = match response {
+                        Ok(response) => response,
+                        Err(e) => {
+                            error!("[{incoming_alias}] Failed to handle message: {e}");
+                            continue;
+                        }
+                    };
+
+                    let response_payload = encode_message(&resp_type, &response, Some(uuid));
+                    if let Err(e) = incoming_tx
+                        .send(WsMessage::Binary(response_payload.into()))
                         .await
                     {
-                        let response_payload = encode_message(&resp_type, &response, Some(uuid));
-                        if let Err(e) = incoming_tx
-                            .send(WsMessage::Binary(response_payload.into()))
-                            .await
-                        {
-                            error!("[{}] Failed to queue response: {}", incoming_alias, e);
-                            break;
-                        }
+                        error!("[{incoming_alias}] Failed to queue response: {e}");
+                        continue;
                     }
                 }
             }
@@ -155,7 +163,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, user: Use
     let outgoing = async move {
         while let Ok(msg) = broadcast_rx.recv().await {
             if let Err(e) = broadcast_tx.send(WsMessage::Binary(msg.into())).await {
-                error!("[{}] Failed to queue broadcast: {}", outgoing_alias, e);
+                error!("[{outgoing_alias}] Failed to queue broadcast: {e}");
                 break;
             }
         }
@@ -174,5 +182,5 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>, user: Use
 
     // Wait for the send task to complete
     let _ = send_task.await;
-    info!("[{}] WebSocket connection closed", alias);
+    info!("[{alias}] WebSocket connection closed");
 }

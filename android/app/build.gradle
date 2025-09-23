@@ -29,8 +29,8 @@ android {
     ndkVersion = "27.1.12297006"
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     defaultConfig {
@@ -42,6 +42,12 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutterVersionCode.toInteger()
         versionName = flutterVersionName
+    }
+
+    tasks.whenTaskAdded { task ->
+        if (task.name.startsWith("configureCMake") || task.name.startsWith("buildCMake")) {
+            task.enabled = false
+        }
     }
 
     buildTypes {

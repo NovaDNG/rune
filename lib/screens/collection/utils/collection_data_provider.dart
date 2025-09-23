@@ -2,7 +2,7 @@ import 'package:flutter/foundation.dart';
 
 import '../../../widgets/start_screen/utils/group.dart';
 import '../../../widgets/start_screen/utils/internal_collection.dart';
-import '../../../messages/all.dart';
+import '../../../bindings/bindings.dart';
 
 import 'fetch_page.dart';
 import 'fetch_groups.dart';
@@ -102,7 +102,6 @@ class CollectionDataProvider with ChangeNotifier {
   ) async {
     final cachedPage = _cache.getPage(collectionType, cursor);
     if (cachedPage != null) {
-      // Assuming if the cached page count is less than pageSize, it indicates the last page
       return (cachedPage, cachedPage.length < _pageSize);
     }
 

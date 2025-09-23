@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
+use fsio::FsIo;
 use log::debug;
 
 use realfft::{RealFftPlanner, RealToComplex};
 use rubato::{FftFixedInOut, Resampler};
 use rustfft::num_complex::Complex;
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::conv::IntoSample;
 use symphonia::core::errors::Error;
 use symphonia::core::sample::Sample;
@@ -97,7 +98,8 @@ impl FFTProcessor {
 
         let fn_is_cancelled: Box<dyn Fn() -> bool> = Box::new(move || {
             cancel_token
-                .as_ref().is_some_and(|token| token.is_cancelled())
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
         });
         let is_cancelled = false;
 
@@ -132,8 +134,8 @@ impl FFTProcessor {
         }
     }
 
-    pub fn process_file(&mut self, file_path: &str) -> Option<AudioDescription> {
-        let mut format = get_format(file_path).expect("no supported audio tracks");
+    pub fn process_file(&mut self, fsio: &FsIo, file_path: &str) -> Option<AudioDescription> {
+        let mut format = get_format(fsio, file_path).expect("no supported audio tracks");
         let track = format
             .tracks()
             .iter()
@@ -297,7 +299,7 @@ impl FFTProcessor {
 
         if !self.sample_buffer.is_empty() {
             // Pad to the nearest multiple of 1024
-            let target_size = ((self.total_samples + 1023) / 1024) * 1024;
+            let target_size = self.total_samples.div_ceil(1024) * 1024;
             while self.sample_buffer.len() < target_size {
                 self.sample_buffer.push(0.0);
             }
@@ -464,6 +466,7 @@ impl FFTProcessor {
 
 #[allow(dead_code)]
 pub fn gpu_fft(
+    fsio: &FsIo,
     file_path: &str,
     window_size: usize,
     batch_size: usize,
@@ -477,11 +480,12 @@ pub fn gpu_fft(
         overlap_size,
         cancel_token,
     )
-    .process_file(file_path)
+    .process_file(fsio, file_path)
 }
 
 #[allow(dead_code)]
 pub fn cpu_fft(
+    fsio: &FsIo,
     file_path: &str,
     window_size: usize,
     overlap_size: usize,
@@ -494,5 +498,5 @@ pub fn cpu_fft(
         overlap_size,
         cancel_token,
     )
-    .process_file(file_path)
+    .process_file(fsio, file_path)
 }

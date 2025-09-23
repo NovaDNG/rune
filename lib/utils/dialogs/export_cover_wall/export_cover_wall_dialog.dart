@@ -3,14 +3,15 @@ import 'dart:ui' as ui;
 
 import 'package:fluent_ui/fluent_ui.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:file_selector/file_selector.dart';
+import 'package:fast_file_picker/fast_file_picker.dart';
+import 'package:file_selector/file_selector.dart' show XTypeGroup;
 
 import '../../../utils/l10n.dart';
 import '../../../utils/dialogs/unavailable_dialog_on_band.dart';
 import '../../../widgets/no_shortcuts.dart';
 import '../../../widgets/responsive_dialog_actions.dart';
 import '../../../screens/settings_library/widgets/progress_button.dart';
-import '../../../messages/playlist.pb.dart';
+import '../../../bindings/bindings.dart';
 
 import '../mix/utils/select_input_controller.dart';
 import '../mix/widgets/select_buttons_section.dart';
@@ -123,7 +124,7 @@ class ExportCoverWallDialogState extends State<ExportCoverWallDialog> {
   Future<void> onConfirmPressed() async {
     final Directory appDocumentsDir = await getApplicationDocumentsDirectory();
 
-    final FileSaveLocation? path = await getSaveLocation(
+    final String? path = await FastFilePicker.pickSaveFile(
       suggestedName: '${widget.title}.png',
       initialDirectory: appDocumentsDir.path,
       acceptedTypeGroups: const [
@@ -157,7 +158,7 @@ class ExportCoverWallDialogState extends State<ExportCoverWallDialog> {
       format: ui.ImageByteFormat.png,
     );
 
-    File(path.path).writeAsBytesSync(
+    File(path).writeAsBytesSync(
       pngBytes!.buffer.asInt8List(),
     );
 

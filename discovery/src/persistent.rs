@@ -1,13 +1,13 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tokio::sync::{broadcast, RwLock, RwLockReadGuard};
+use tokio::sync::{RwLock, RwLockReadGuard, broadcast};
 
 /// Represents errors that can occur during persistent data management.
 ///
@@ -298,11 +298,11 @@ where
     ///
     /// # Arguments
     /// * `updater` - A closure that takes a clone of the current data, modifies it, and returns
-    ///               a `Result` containing a tuple of the updated data and a result value of type `R`.
+    ///   a `Result` containing a tuple of the updated data and a result value of type `R`.
     ///
     /// # Returns
     /// * `Result<R, E>` - The result of the update operation as returned by the `updater` closure.
-    ///                    The error type `E` must be able to be created from `PersistenceError`.
+    ///   The error type `E` must be able to be created from `PersistenceError`.
     ///
     /// # Type Parameters
     /// * `F` - The type of the updater closure.

@@ -41,8 +41,8 @@ class _NowPlayingTrackCoverArtButtonState
             child: CoverArt(
               path: status.coverArtPath,
               hint: (
-                status.album,
-                status.artist,
+                status.album ?? "",
+                status.artist ?? "",
                 'Total Time ${formatTime(status.duration)}'
               ),
               size: widget.size,

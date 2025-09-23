@@ -148,7 +148,7 @@ impl FFTCompute {
 mod tests {
     use super::*;
     use crate::measure_time;
-    use rustfft::{num_complex::Complex32, FftPlanner};
+    use rustfft::{FftPlanner, num_complex::Complex32};
 
     fn generate_random_data(len: usize) -> Vec<Complex32> {
         (0..len)
@@ -183,12 +183,8 @@ mod tests {
             }
         }
 
-        log::info!(
-            "Max real difference: {} at index {}",
-            max_diff_re,
-            max_diff_idx
-        );
-        log::info!("Max imaginary difference: {}", max_diff_im);
+        log::info!("Max real difference: {max_diff_re} at index {max_diff_idx}");
+        log::info!("Max imaginary difference: {max_diff_im}");
         log::info!(
             "Value at max diff - v1: {}, v2: {}",
             v1[max_diff_idx],

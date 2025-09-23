@@ -1,14 +1,14 @@
 import 'dart:async';
 
-import '../../messages/all.dart';
+import '../../bindings/bindings.dart';
 
 Future<SearchForResponse> searchFor(String query) async {
   if (!query.endsWith('*')) {
     query = '$query*';
   }
 
-  final searchRequest = SearchForRequest(queryStr: query, n: 30);
-  searchRequest.sendSignalToRust(); // GENERATED
+  final searchRequest = SearchForRequest(queryStr: query, n: 30, fields: []);
+  searchRequest.sendSignalToRust();
 
   return (await SearchForResponse.rustSignalStream.first).message;
 }

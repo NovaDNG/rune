@@ -155,20 +155,22 @@ macro_rules! parallel_media_files_processing {
         $cancel_token:expr,
         $cursor_query:expr,
         $lib_path:expr,
+        $fsio:expr,
+        $node_id: expr,
         $process_fn:expr,
         $result_handler:expr
     ) => {{
         use async_channel;
-        use tokio::sync::{Semaphore, Mutex};
-        use tokio::task;
-        use log::{debug, error, warn, info};
+        use log::{debug, error, info, warn};
         use std::sync::Arc;
+        use tokio::sync::{Mutex, Semaphore};
+        use tokio::task;
 
         let cursor_query_clone = $cursor_query.clone();
         let (tx, rx) = async_channel::bounded($batch_size);
         info!("Batch size: {}", $batch_size);
         let total_tasks = cursor_query_clone.count($main_db).await? as usize;
-        info!("Total tasks: {}", total_tasks);
+        info!("Total tasks: {}", { total_tasks });
         let processed_count = Arc::new(Mutex::new(0));
 
         let producer_cancel_token = $cancel_token.clone();
@@ -183,24 +185,26 @@ macro_rules! parallel_media_files_processing {
                             info!("Cancellation requested. Exiting producer loop.");
                             // Handle the error gracefully
                             if let Err(e) = tx.send(None).await {
-                                warn!("Failed to send termination signal: {:#?}", e);
+                                warn!("Failed to send termination signal: {:#?}", { e });
                             }
                             break;
                         }
                     }
 
-                    let files = match cursor.first($batch_size.try_into().unwrap())
+                    let files = match cursor
+                        .first($batch_size.try_into().unwrap())
                         .all($main_db)
-                        .await {
-                            Ok(f) => f,
-                            Err(e) => {
-                                error!("Database error: {:?}", e);
-                                // Send termination signal on error
-                                if let Err(e) = tx.send(None).await {
-                                    warn!("Failed to send termination signal: {:#?}", e);
-                                }
-                                return Err(e);
+                        .await
+                    {
+                        Ok(f) => f,
+                        Err(e) => {
+                            error!("Database error: {e:?}");
+                            // Send termination signal on error
+                            if let Err(e) = tx.send(None).await {
+                                warn!("Failed to send termination signal: {:#?}", { e });
                             }
+                            return Err(e);
+                        }
                     };
 
                     if files.is_empty() {
@@ -218,16 +222,16 @@ macro_rules! parallel_media_files_processing {
                             if token.is_cancelled() {
                                 info!("Cancellation requested during file sending.");
                                 if let Err(e) = tx.send(None).await {
-                                    warn!("Failed to send termination signal: {:#?}", e);
+                                    warn!("Failed to send termination signal: {:#?}", { e });
                                 }
                                 return Ok(());
                             }
                         }
 
                         match tx.send(Some(file.clone())).await {
-                            Ok(_) => {},
+                            Ok(_) => {}
                             Err(e) => {
-                                warn!("Failed to send file: {:#?}", e);
+                                warn!("Failed to send file: {:#?}", { e });
                                 return Ok(());
                             }
                         }
@@ -268,28 +272,45 @@ macro_rules! parallel_media_files_processing {
                             let permit = match semaphore.acquire_owned().await {
                                 Ok(permit) => permit,
                                 Err(e) => {
-                                    error!("Failed to acquire semaphore: {:?}", e);
+                                    error!("Failed to acquire semaphore: {e:?}");
                                     continue;
                                 }
                             };
 
                             let lib_path = Arc::clone(&$lib_path);
+                            let fsio = $fsio.clone();
                             let processed_count = Arc::clone(&processed_count);
                             let progress_callback = Arc::clone(&progress_callback);
+                            let node_id_clone = $node_id.clone();
                             let process_cancel_token = consumer_cancel_token.clone();
 
                             let file_clone = file.clone();
                             let task = task::spawn(async move {
                                 let analysis_result = task::spawn_blocking(move || {
                                     let process_fn = $process_fn;
-                                    process_fn(&file_clone, &lib_path, process_cancel_token)  // Pass the cloned token
-                                }).await;
+                                    process_fn(
+                                        fsio.as_ref(),
+                                        &file_clone,
+                                        &lib_path,
+                                        process_cancel_token,
+                                    )
+                                    // Pass the cloned token
+                                })
+                                .await;
 
-                                match analysis_result.with_context(|| "Failed to spawn analysis task") {
+                                match analysis_result
+                                    .with_context(|| "Failed to spawn analysis task")
+                                {
                                     Ok(analysis_result) => {
-                                        $result_handler(&main_db, file, analysis_result).await;
+                                        $result_handler(
+                                            &main_db,
+                                            file,
+                                            node_id_clone,
+                                            analysis_result,
+                                        )
+                                        .await;
                                     }
-                                    Err(e) => error!("{:?}", e),
+                                    Err(e) => error!("{e:?}"),
                                 }
 
                                 let mut count = processed_count.lock().await;
@@ -305,7 +326,7 @@ macro_rules! parallel_media_files_processing {
                             info!("No files left, waiting for active tasks to complete...");
                             for task in active_tasks {
                                 if let Err(e) = task.await {
-                                    error!("Task join error: {:?}", e);
+                                    error!("Task join error: {e:?}");
                                 }
                             }
                             break;
@@ -323,14 +344,13 @@ macro_rules! parallel_media_files_processing {
 
         // Handle any errors from producer or consumer
         if let Err(e) = producer_result {
-            error!("Producer error: {:?}", e);
+            error!("Producer error: {e:?}");
         }
         if let Err(e) = consumer_result {
-            error!("Consumer error: {:?}", e);
+            error!("Consumer error: {e:?}");
         }
 
-
-        info!("Total tasks executed: {}", total_tasks);
+        info!("Total tasks executed: {}", { total_tasks });
 
         Ok(total_tasks)
     }};

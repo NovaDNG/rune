@@ -5,15 +5,15 @@ use anyhow::Result;
 use database::connection::MainDbConnection;
 
 use crate::{
+    Session, Signal,
     messages::*,
     utils::{GlobalParams, ParamsExtractor},
-    Session, Signal,
 };
 use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "windows")]
 pub async fn check_store_license() -> Result<Option<(String, bool, bool)>> {
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
     use windows::Foundation::AsyncStatus;
     use windows::Services::Store::StoreContext;
 
@@ -113,8 +113,8 @@ impl Signal for RegisterLicenseRequest {
                     valid: false,
                     license: None,
                     success: false,
-                    error: Some(format!("{:#?}", e)),
-                }))
+                    error: Some(format!("{e:#?}")),
+                }));
             }
         };
 
@@ -122,12 +122,12 @@ impl Signal for RegisterLicenseRequest {
         let mut hasher = Sha256::new();
         hasher.update(&file_content);
         let result = hasher.finalize();
-        let license_hash = format!("{:x}", result);
+        let license_hash = format!("{result:x}");
 
         let mut hasher = Sha256::new();
         hasher.update(license_hash.as_bytes());
         let result = hasher.finalize();
-        let validation_hash = format!("{:x}", result);
+        let validation_hash = format!("{result:x}");
 
         // Validate the License
         let valid = LICENSES.contains(&validation_hash.as_str());
@@ -179,17 +179,15 @@ impl Signal for ValidateLicenseRequest {
         is_pro = is_pro || pro_via_args;
         is_store_mode = is_store_mode || store_via_args;
 
-        if !is_pro {
-            if let Some(license) = license {
-                let mut hasher = Sha256::new();
-                hasher.update(license.as_bytes());
-                let result = hasher.finalize();
-                let hash_str = format!("{:x}", result);
+        if !is_pro && let Some(license) = license {
+            let mut hasher = Sha256::new();
+            hasher.update(license.as_bytes());
+            let result = hasher.finalize();
+            let hash_str = format!("{result:x}");
 
-                let pro_via_license = LICENSES.contains(&hash_str.as_str());
+            let pro_via_license = LICENSES.contains(&hash_str.as_str());
 
-                is_pro = is_pro || pro_via_license;
-            }
+            is_pro = is_pro || pro_via_license;
         }
 
         let store_license = check_store_license().await;

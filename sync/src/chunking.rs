@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use log::{debug, info, warn};
 use sea_orm::{DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
@@ -18,7 +18,7 @@ use uuid::Uuid;
 // Use the refined HLC module functions/traits
 use crate::{
     foreign_key::{ForeignKeyResolver, ModelWithForeignKeyOps},
-    hlc::{calculate_hash as calculate_record_hash, HLCModel, HLCQuery, HLCRecord, HLC},
+    hlc::{HLC, HLCModel, HLCQuery, HLCRecord, calculate_hash as calculate_record_hash},
 };
 
 const MILLISECONDS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
@@ -228,7 +228,7 @@ where
 /// # Type Parameters
 ///
 /// * `E`: The SeaORM `EntityTrait`. Its associated `Model` must implement `HLCRecord`.
-///       `E` itself must implement `HLCModel`.
+///   `E` itself must implement `HLCModel`.
 ///
 /// # Arguments
 ///
@@ -261,7 +261,11 @@ where
 
     let mut chunks = Vec::new();
     // Start from HLC(0,0,node) or the specified start point
-    let mut current_hlc = start_hlc_exclusive.unwrap_or_else(|| HLC::new(options.node_id));
+    let mut current_hlc = start_hlc_exclusive.unwrap_or(HLC {
+        timestamp_ms: 0,
+        version: 0,
+        node_id: options.node_id,
+    });
 
     // Find the latest HLC in the dataset to calculate age relative to the "present"
     let latest_record_opt: Option<E::Model> = E::find()
@@ -305,10 +309,7 @@ where
         latest_hlc_timestamp
     };
 
-    debug!(
-        "Latest HLC timestamp for age calculation: {}",
-        effective_latest_timestamp
-    );
+    debug!("Latest HLC timestamp for age calculation: {effective_latest_timestamp}");
 
     let mut safety_count = 0;
     const MAX_ITERATIONS: u32 = 1_000_000; // Safety break
@@ -317,8 +318,7 @@ where
         safety_count += 1;
         if safety_count > MAX_ITERATIONS {
             warn!(
-                "Chunk generation exceeded {} iterations, breaking loop. Check logic or data.",
-                MAX_ITERATIONS
+                "Chunk generation exceeded {MAX_ITERATIONS} iterations, breaking loop. Check logic or data."
             );
             // Consider returning an error instead?
             // return Err(anyhow::anyhow!("Chunk generation exceeded maximum iterations ({})", MAX_ITERATIONS));
@@ -348,8 +348,7 @@ where
         );
 
         debug!(
-            "Current HLC: {}, Age (days): {:.2} (raw {:.2}), AgeFactorCeil: {}, DesiredSize: {:.2}, WindowSize: {}",
-            current_hlc, non_negative_age_days, age_days, age_factor_ceil, desired_size, window_size
+            "Current HLC: {current_hlc}, Age (days): {non_negative_age_days:.2} (raw {age_days:.2}), AgeFactorCeil: {age_factor_ceil}, DesiredSize: {desired_size:.2}, WindowSize: {window_size}"
         );
 
         // Fetch the next batch of records strictly *after* current_hlc, up to window_size
@@ -360,17 +359,11 @@ where
             .all(db)
             .await
             .with_context(|| {
-                format!(
-                    "Failed to fetch next batch of records after HLC {}",
-                    current_hlc
-                )
+                format!("Failed to fetch next batch of records after HLC {current_hlc}")
             })?;
 
         if records.is_empty() {
-            debug!(
-                "No more records found after HLC {}. Chunk generation complete.",
-                current_hlc
-            );
+            debug!("No more records found after HLC {current_hlc}. Chunk generation complete.");
             break; // No more records to process
         }
 
@@ -402,8 +395,13 @@ where
         // Ensure HLC ordering within the fetched batch (should be guaranteed by query order)
         if chunk_start_hlc > chunk_end_hlc {
             // This indicates a potential issue with query ordering or HLC data corruption
-            warn!("Inconsistent HLC order within fetched batch: Start {} > End {}. Record IDs: {} to {}",
-                 chunk_start_hlc, chunk_end_hlc, first_record.unique_id(), last_record.unique_id());
+            warn!(
+                "Inconsistent HLC order within fetched batch: Start {} > End {}. Record IDs: {} to {}",
+                chunk_start_hlc,
+                chunk_end_hlc,
+                first_record.unique_id(),
+                last_record.unique_id()
+            );
             // Depending on requirements, maybe bail or log and continue? Bailing is safer.
             bail!("Detected inconsistent HLC order within fetched batch for chunking.");
         }
@@ -413,27 +411,26 @@ where
         // Calculate hash for the chunk using the models fetched
         let chunk_hash = calculate_chunk_hash::<E::Model>(&records).with_context(|| {
             format!(
-                "Failed to calculate hash for chunk [{}-{}], count {}",
-                chunk_start_hlc, chunk_end_hlc, chunk_count
+                "Failed to calculate hash for chunk [{chunk_start_hlc}-{chunk_end_hlc}], count {chunk_count}"
             )
         })?;
 
         let mut current_chunk_fk_mappings: Option<ChunkFkMapping> = None;
-        if let Some(resolver) = fk_resolver {
-            if !records.is_empty() {
-                let mappings = resolver
-                    .generate_fk_mappings_for_records(&records, db)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to generate FK mappings for chunk of entity {}",
-                            E::table_name(&E::default())
-                        )
-                    })?;
+        if let Some(resolver) = fk_resolver
+            && !records.is_empty()
+        {
+            let mappings = resolver
+                .generate_fk_mappings_for_records(&records, db)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to generate FK mappings for chunk of entity {}",
+                        E::table_name(&E::default())
+                    )
+                })?;
 
-                if !mappings.is_empty() {
-                    current_chunk_fk_mappings = Some(mappings);
-                }
+            if !mappings.is_empty() {
+                current_chunk_fk_mappings = Some(mappings);
             }
         }
 
@@ -445,7 +442,7 @@ where
             fk_mappings: current_chunk_fk_mappings,
         };
 
-        debug!("Generated chunk: {:?}", data_chunk);
+        debug!("Generated chunk: {data_chunk:?}");
         chunks.push(data_chunk);
 
         // Update current_hlc to the HLC of the *last* record processed in this chunk
@@ -469,7 +466,7 @@ where
 /// # Type Parameters
 ///
 /// * `E`: The SeaORM `EntityTrait`. Its associated `Model` must implement `HLCRecord`.
-///       `E` itself must implement `HLCModel`.
+///   `E` itself must implement `HLCModel`.
 ///
 /// # Arguments
 ///
@@ -522,9 +519,10 @@ where
         let expected_empty_hash = calculate_chunk_hash::<E::Model>(&[])?; // Use empty slice
         if parent_chunk.chunk_hash != expected_empty_hash {
             bail!(
-                     "Data inconsistency detected: Parent chunk reported 0 count, but hash mismatch (Expected empty hash '{}', Found '{}').",
-                     expected_empty_hash, parent_chunk.chunk_hash
-                 );
+                "Data inconsistency detected: Parent chunk reported 0 count, but hash mismatch (Expected empty hash '{}', Found '{}').",
+                expected_empty_hash,
+                parent_chunk.chunk_hash
+            );
         }
         // If hash matches for empty chunk, verification passed.
         debug!("Parent chunk was empty and verified successfully.");
@@ -568,7 +566,10 @@ where
         );
         bail!(
             "Data inconsistency detected: Record count mismatch for chunk [{}-{}] (Expected {}, Found {}).",
-            parent_chunk.start_hlc, parent_chunk.end_hlc, parent_chunk.count, records.len()
+            parent_chunk.start_hlc,
+            parent_chunk.end_hlc,
+            parent_chunk.count,
+            records.len()
         );
     }
 
@@ -593,7 +594,10 @@ where
             );
             bail!(
                 "Data inconsistency detected: Hash mismatch for chunk [{}-{}] (Expected '{}', Calculated '{}').",
-                parent_chunk.start_hlc, parent_chunk.end_hlc, parent_chunk.chunk_hash, calculated_parent_hash
+                parent_chunk.start_hlc,
+                parent_chunk.end_hlc,
+                parent_chunk.chunk_hash,
+                calculated_parent_hash
             );
         }
     } else {
@@ -601,9 +605,10 @@ where
         let expected_empty_hash = calculate_chunk_hash::<E::Model>(&records)?; // records is empty here
         if parent_chunk.chunk_hash != expected_empty_hash {
             bail!(
-                 "Data inconsistency detected: Parent chunk reported 0 count, but hash mismatch (Expected empty hash '{}', Found '{}').",
-                 expected_empty_hash, parent_chunk.chunk_hash
-             );
+                "Data inconsistency detected: Parent chunk reported 0 count, but hash mismatch (Expected empty hash '{}', Found '{}').",
+                expected_empty_hash,
+                parent_chunk.chunk_hash
+            );
         }
         // If hash matches for empty chunk, verification passed.
         debug!("Parent chunk was empty and verified successfully.");
@@ -653,27 +658,24 @@ where
         // Calculate hash for this specific sub-chunk
         let sub_chunk_hash = calculate_chunk_hash::<E::Model>(sub_chunk_records_slice)
             .with_context(|| {
-                format!(
-                    "Failed to calculate hash for sub-chunk [{}-{}]",
-                    sub_start_hlc, sub_end_hlc
-                )
+                format!("Failed to calculate hash for sub-chunk [{sub_start_hlc}-{sub_end_hlc}]")
             })?;
 
         let mut sub_chunk_fk_map: Option<ChunkFkMapping> = None;
-        if let Some(resolver) = fk_resolver {
-            if !sub_chunk_records_slice.is_empty() {
-                let mappings = resolver
-                    .generate_fk_mappings_for_records(sub_chunk_records_slice, db)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to generate FK mappings for sub-chunk of entity {}",
-                            E::table_name(&E::default())
-                        )
-                    })?;
-                if !mappings.is_empty() {
-                    sub_chunk_fk_map = Some(mappings);
-                }
+        if let Some(resolver) = fk_resolver
+            && !sub_chunk_records_slice.is_empty()
+        {
+            let mappings = resolver
+                .generate_fk_mappings_for_records(sub_chunk_records_slice, db)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to generate FK mappings for sub-chunk of entity {}",
+                        E::table_name(&E::default())
+                    )
+                })?;
+            if !mappings.is_empty() {
+                sub_chunk_fk_map = Some(mappings);
             }
         }
 
@@ -721,7 +723,7 @@ pub mod tests {
         use super::*; // Inherit imports from parent test module
         use crate::{
             foreign_key::FkPayload,
-            hlc::{HLCModel, HLCRecord, HLC},
+            hlc::{HLC, HLCModel, HLCRecord},
         };
         use async_trait::async_trait;
         use sea_orm::DeriveEntityModel;
@@ -757,7 +759,7 @@ pub mod tests {
                 match DateTime::parse_from_rfc3339(&self.updated_at_hlc_ts) {
                     Ok(dt) => Some(HLC {
                         timestamp_ms: dt.timestamp_millis() as u64, // Convert to u64 millis
-                        version: self.updated_at_hlc_v as u32,   // Convert back to u32
+                        version: self.updated_at_hlc_v as u32,      // Convert back to u32
                         node_id: self.updated_at_hlc_nid,
                     }),
                     Err(e) => {
@@ -850,7 +852,7 @@ pub mod tests {
         // Create a NaiveDateTime from seconds and nanoseconds
         let seconds = (millis / 1000) as i64;
         let nanos = (millis % 1000 * 1_000_000) as u32; // Millis to Nanos
-                                                        // Use Utc.timestamp_opt to handle potential out-of-range values gracefully
+        // Use Utc.timestamp_opt to handle potential out-of-range values gracefully
         match Utc.timestamp_opt(seconds, nanos) {
             chrono::LocalResult::Single(dt) => {
                 // Format with full nanosecond precision and UTC offset ('Z' or +00:00)
@@ -885,7 +887,7 @@ pub mod tests {
         // Convert HLC timestamp (u64 ms) to RFC3339 string for storage
         let hlc_ts_str = hlc_timestamp_millis_to_rfc3339(hlc.timestamp_ms)
             // Convert the anyhow::Error from the helper to DbErr for compatibility
-            .map_err(|e| DbErr::Custom(format!("Failed to format HLC timestamp: {}", e)))?;
+            .map_err(|e| DbErr::Custom(format!("Failed to format HLC timestamp: {e}")))?;
 
         // Create an ActiveModel with the data, including the formatted timestamp string
         let active_model = ActiveModel {
@@ -1343,7 +1345,7 @@ pub mod tests {
         let err_msg = result.err().unwrap().to_string();
         assert!(err_msg.contains("Hash mismatch"));
         assert!(err_msg.contains(&format!("Expected '{}'", parent_chunk.chunk_hash)));
-        assert!(err_msg.contains(&format!("Calculated '{}'", correct_hash)));
+        assert!(err_msg.contains(&format!("Calculated '{correct_hash}'")));
 
         Ok(())
     }
@@ -1383,7 +1385,7 @@ pub mod tests {
         // Assert that the error message indicates a hash mismatch for an empty chunk
         let err_msg = result.err().unwrap().to_string();
         assert!(err_msg.contains("Parent chunk reported 0 count, but hash mismatch"));
-        assert!(err_msg.contains(&format!("Expected empty hash '{}'", correct_empty_hash)));
+        assert!(err_msg.contains(&format!("Expected empty hash '{correct_empty_hash}'")));
         assert!(err_msg.contains(&format!("Found '{}'", parent_chunk.chunk_hash)));
 
         Ok(())
@@ -1635,8 +1637,7 @@ pub mod tests {
         let err_msg = result.err().unwrap().to_string();
         assert!(
             err_msg.contains("Sub-chunk size cannot be zero"),
-            "Error message was: {}",
-            err_msg
+            "Error message was: {err_msg}"
         );
 
         Ok(())
@@ -1676,8 +1677,7 @@ pub mod tests {
             err_msg.contains(
                 "Invalid parent chunk definition: start_hlc > end_hlc with non-zero count."
             ),
-            "Error message was: {}",
-            err_msg
+            "Error message was: {err_msg}"
         );
 
         Ok(())

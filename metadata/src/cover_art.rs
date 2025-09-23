@@ -1,10 +1,18 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::{GenericImageView, ImageBuffer, Pixel};
 use lofty::file::TaggedFileExt;
 use log::{error, info};
-use palette_extract::{get_palette_rgb, Color};
+use palette_extract::{Color, get_palette_rgb};
+
+use ::fsio::FsIo;
+use symphonia::core::{
+    formats::FormatOptions,
+    io::{MediaSource, MediaSourceStream},
+    meta::MetadataOptions,
+    probe::Hint,
+};
 
 use crate::crc::media_crc32;
 
@@ -59,20 +67,29 @@ pub fn color_to_int(color: &Color) -> i32 {
     (alpha << 24) | (r << 16) | (g << 8) | b
 }
 
-pub fn extract_cover_art_binary(file_path: &Path, lib_path: Option<&Path>) -> Option<CoverArt> {
-    if let Some(cover_art) = extract_from_tagged_file(file_path) {
+pub fn extract_cover_art_binary<P: AsRef<Path>>(
+    fsio: &FsIo,
+    lib_path: Option<&Path>,
+    file_path: &P,
+) -> Option<CoverArt> {
+    if let Some(cover_art) = extract_from_tagged_file(fsio, file_path) {
         return Some(cover_art);
     }
 
     if let Some(lib_path) = lib_path {
         info!("Falling back to external cover art");
-        return fallback_to_external_cover(file_path, lib_path);
+        return fallback_to_external_cover(fsio, file_path.as_ref(), lib_path);
     }
 
     None
 }
 
-fn extract_from_tagged_file(file_path: &Path) -> Option<CoverArt> {
+fn extract_from_tagged_file<P: AsRef<Path>>(fsio: &FsIo, file_path: &P) -> Option<CoverArt> {
+    let file_path = match fsio.canonicalize_path(file_path.as_ref()) {
+        Ok(x) => x,
+        Err(_) => return None,
+    };
+
     let tagged_file = lofty::read_from_path(file_path).ok()?;
 
     let tag = tagged_file
@@ -96,7 +113,7 @@ fn extract_from_tagged_file(file_path: &Path) -> Option<CoverArt> {
         return None;
     }
 
-    let crc_string = format!("{:08x}", crc);
+    let crc_string = format!("{crc:08x}");
 
     Some(CoverArt {
         crc: crc_string,
@@ -105,7 +122,52 @@ fn extract_from_tagged_file(file_path: &Path) -> Option<CoverArt> {
     })
 }
 
-fn fallback_to_external_cover(file_path: &Path, lib_path: &Path) -> Option<CoverArt> {
+pub async fn extract_cover_art_from_stream(
+    source: Box<dyn MediaSource>,
+    mime_type: &str,
+) -> Result<CoverArt> {
+    let mss = MediaSourceStream::new(source, Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(mime_type);
+
+    let meta_opts: MetadataOptions = Default::default();
+    let fmt_opts: FormatOptions = Default::default();
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &fmt_opts, &meta_opts)
+        .context("Failed to probe media source")?;
+
+    let mut format = probed.format;
+
+    if let Some(metadata) = format.metadata().current()
+        && let Some(visual) = metadata.visuals().first()
+    {
+        let cover_data = visual.data.to_vec();
+        if cover_data.is_empty() {
+            return Err(anyhow::anyhow!("Empty cover art data in stream"));
+        }
+
+        let rgb_sequence = decode_image(&cover_data)?;
+
+        // Calculate the CRC
+        let crc = media_crc32(&rgb_sequence, 0, 0, rgb_sequence.len());
+        if crc == 0 {
+            return Err(anyhow::anyhow!("Invalid CRC for cover art"));
+        }
+        let primary_color = get_palette_rgb(&rgb_sequence)[0];
+        let crc_string = format!("{crc:08x}");
+
+        return Ok(CoverArt {
+            crc: crc_string,
+            data: cover_data,
+            primary_color: color_to_int(&primary_color),
+        });
+    }
+
+    Err(anyhow::anyhow!("No cover art found in stream"))
+}
+
+fn fallback_to_external_cover(fsio: &FsIo, lib_path: &Path, file_path: &Path) -> Option<CoverArt> {
     if !file_path.starts_with(lib_path) {
         error!("File path is not within the library path");
         return None;
@@ -155,10 +217,13 @@ fn fallback_to_external_cover(file_path: &Path, lib_path: &Path) -> Option<Cover
     while current_dir.starts_with(lib_path) {
         for cover_name in &cover_names {
             let cover_path = current_dir.join(cover_name);
-            if cover_path.exists() {
-                if let Some(cover_art) = process_external_cover(&cover_path) {
-                    return Some(cover_art);
-                }
+            let exists = match fsio.exists(&cover_path) {
+                Ok(x) => x,
+                Err(_) => return None,
+            };
+
+            if exists && let Some(cover_art) = process_external_cover(fsio, &cover_path) {
+                return Some(cover_art);
             }
         }
         current_dir = current_dir.parent()?;
@@ -167,8 +232,8 @@ fn fallback_to_external_cover(file_path: &Path, lib_path: &Path) -> Option<Cover
     None
 }
 
-fn process_external_cover(cover_path: &Path) -> Option<CoverArt> {
-    let cover_data = std::fs::read(cover_path).ok()?;
+fn process_external_cover(fsio: &FsIo, cover_path: &Path) -> Option<CoverArt> {
+    let cover_data = fsio.read(cover_path).ok()?;
 
     if cover_data.is_empty() {
         return None;
@@ -184,7 +249,7 @@ fn process_external_cover(cover_path: &Path) -> Option<CoverArt> {
         return None;
     }
 
-    let crc_string = format!("{:08x}", crc);
+    let crc_string = format!("{crc:08x}");
 
     Some(CoverArt {
         crc: crc_string,

@@ -141,8 +141,7 @@ impl TableSyncResult {
             Self::Success(summary) => summary,
             Self::Failure { table_name, error } => {
                 panic!(
-                    "called unwrap_summary() on a Failure value for table '{}': {:?}",
-                    table_name, error
+                    "called unwrap_summary() on a Failure value for table '{table_name}': {error:?}"
                 )
             }
         }
@@ -155,8 +154,7 @@ impl TableSyncResult {
             Self::Success(summary) => summary,
             Self::Failure { table_name, error } => {
                 panic!(
-                    "called summary_ref() on a Failure value for table '{}': {:?}",
-                    table_name, error
+                    "called summary_ref() on a Failure value for table '{table_name}': {error:?}"
                 )
             }
         }
@@ -203,8 +201,7 @@ impl SyncScheduler {
             let initial_hlc_for_log = job.initial_metadata.last_sync_hlc.clone();
 
             info!(
-                "Scheduler: Starting sync for table '{}' from HLC: {}",
-                table_name_for_log, initial_hlc_for_log
+                "Scheduler: Starting sync for table '{table_name_for_log}' from HLC: {initial_hlc_for_log}"
             );
 
             match (job.task)(context, job.initial_metadata).await {
@@ -216,10 +213,7 @@ impl SyncScheduler {
                     results.push(TableSyncResult::Success(updated_metadata));
                 }
                 Err(e) => {
-                    error!(
-                        "Scheduler: Failed to sync table '{}': {:?}",
-                        table_name_for_log, e
-                    );
+                    error!("Scheduler: Failed to sync table '{table_name_for_log}': {e:?}");
                     results.push(TableSyncResult::Failure {
                         table_name: table_name_for_log,
                         error: e,
@@ -246,11 +240,11 @@ impl Default for SyncScheduler {
 mod tests {
     use super::*;
     use crate::chunking::ChunkingOptions;
-    use crate::core::tests::test_entity;
+    use crate::core::SyncDirection;
     use crate::core::tests::MockRemoteDataSource;
     use crate::core::tests::NoOpForeignKeyResolver;
-    use crate::core::SyncDirection;
-    use crate::hlc::{SyncTaskContext, HLC};
+    use crate::core::tests::test_entity;
+    use crate::hlc::{HLC, SyncTaskContext};
 
     use anyhow::anyhow;
     use sea_orm::{ConnectionTrait, Database, DbBackend, DbConn, Schema};

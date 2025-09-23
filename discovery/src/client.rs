@@ -5,22 +5,22 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use anyhow::{anyhow, bail, Result};
-use futures::{future::select_all, FutureExt};
+use anyhow::{Result, anyhow, bail};
+use futures::{FutureExt, future::select_all};
 use http_body_util::Empty;
-use hyper::{body::Bytes, http::Error as HttpError, Uri};
+use hyper::{Uri, body::Bytes, http::Error as HttpError};
 use hyper_util::rt::TokioIo;
 use log::warn;
 use pem::Pem;
 use rustls::{
+    Error as RustlsError, RootCertStore, SignatureScheme,
     client::{
-        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
         ClientConfig, WebPkiServerVerifier,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     },
     crypto::ring::default_provider,
     pki_types::{CertificateDer, ServerName, UnixTime},
     server::VerifierBuilderError,
-    Error as RustlsError, RootCertStore, SignatureScheme,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -398,7 +398,7 @@ impl CertValidator {
     pub fn fingerprints(&self) -> Result<HashMap<String, Vec<String>>> {
         self.cached_entries
             .read() // Acquire read lock on cache
-            .map_err(|e| anyhow!("Unable to read fingerprints: {}", e)) // Map lock error to anyhow Error
+            .map_err(|e| anyhow!("Unable to read fingerprints: {e}")) // Map lock error to anyhow Error
             .map(|guard| guard.clone()) // Clone the HashMap from the read guard
     }
 
@@ -578,7 +578,7 @@ pub async fn fetch_server_certificate(url: &str) -> Result<ServerCert, CertValid
 
     tokio::spawn(async move {
         if let Err(err) = connection.await {
-            eprintln!("Connection error: {}", err); // Spawn task to handle connection errors
+            eprintln!("Connection error: {}", { err }); // Spawn task to handle connection errors
         }
     });
 

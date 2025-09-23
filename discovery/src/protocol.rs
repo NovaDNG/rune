@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use log::{debug, error, info};
@@ -137,7 +137,7 @@ impl DiscoveryService {
     ///
     /// # Arguments
     /// * `path` -  Path to the directory where device discovery data will be persisted.
-    ///             If persistence is not required, use [`DiscoveryService::new_without_store`].
+    ///   If persistence is not required, use [`DiscoveryService::new_without_store`].
     ///
     /// # Returns
     /// `Result<Self>` - A `Result` containing the new `DiscoveryService` instance, or an error if initialization fails.
@@ -158,7 +158,7 @@ impl DiscoveryService {
 
         match result.initialize().await {
             Ok(_) => info!("Discovery service initialized"),
-            Err(e) => error!("Failed to initialize discovery service: {}", e),
+            Err(e) => error!("Failed to initialize discovery service: {e}"),
         };
 
         Ok(result)
@@ -337,7 +337,7 @@ impl DiscoveryService {
         let msg = serde_json::to_vec(&announcement)?;
 
         for socket in sockets.iter() {
-            let target = format!("{}:{}", MULTICAST_GROUP, MULTICAST_PORT);
+            let target = format!("{MULTICAST_GROUP}:{MULTICAST_PORT}");
             match socket.send_to(&msg, &target).await {
                 Ok(bytes_sent) => debug!("[{}] Sent {} bytes", socket.local_addr()?, bytes_sent),
                 Err(e) => error!("Send error on {}: {}", socket.local_addr()?, e),
@@ -406,7 +406,7 @@ impl DiscoveryService {
                     "announce": true
                 });
                 if let Err(e) = Self::send_announcement(&sockets, &announcement).await {
-                    error!("Announcement failed: {}", e);
+                    error!("Announcement failed: {e}");
                 }
             };
 
@@ -523,10 +523,10 @@ impl DiscoveryService {
                                             break; // Exit loop if channel is closed (likely during shutdown)
                                         }
 
-                                        error!("Error handling datagram: {}", e);
+                                        error!("Error handling datagram: {e}");
                                     }
                                 }
-                                Err(e) => error!("Receive error: {}", e), // Log socket receive errors
+                                Err(e) => error!("Receive error: {e}"), // Log socket receive errors
                             }
                         }
                     }

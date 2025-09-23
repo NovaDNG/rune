@@ -1,12 +1,12 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::path::Path;
+use std::{collections::HashMap, fs::File, path::Path};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTagKey, Value};
 use symphonia::core::probe::{Hint, ProbeResult};
+
+use ::fsio::FsNode;
 
 fn create_standard_tag_key_maps() -> (
     HashMap<StandardTagKey, &'static str>,
@@ -183,7 +183,7 @@ pub fn string_to_standard_tag_key(s: &str) -> Option<StandardTagKey> {
     STRING_TO_STANDARD_TAG_KEY.get(s).cloned()
 }
 
-fn push_tags(
+pub fn push_tags(
     revision: &MetadataRevision,
     metadata_list: &mut Vec<(String, String)>,
     field_blacklist: &[&str],
@@ -225,7 +225,7 @@ fn probe_audio_file<P: AsRef<Path>>(file_path: P) -> Result<ProbeResult> {
 
     // Create the media source stream.
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
-    let ext = file_path_str.split('.').last().unwrap_or_default();
+    let ext = file_path_str.split('.').next_back().unwrap_or_default();
     hint.with_extension(ext);
 
     // Use the default options for metadata and format readers.
@@ -235,7 +235,7 @@ fn probe_audio_file<P: AsRef<Path>>(file_path: P) -> Result<ProbeResult> {
     // Probe the media source.
     let probed = symphonia::default::get_probe()
         .format(&hint, mss, &fmt_opts, &meta_opts)
-        .map_err(|e| anyhow::anyhow!("Failed to probe file: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to probe file: {e}"))?;
 
     Ok(probed)
 }
@@ -274,11 +274,11 @@ pub fn get_lyrics<P: AsRef<Path>>(file_path: P) -> Result<Option<String>> {
     Ok(None)
 }
 
-pub fn get_metadata<P: AsRef<Path>>(
-    file_path: P,
+pub fn get_metadata(
+    fs_node: &FsNode,
     field_blacklist: Option<Vec<&str>>,
 ) -> Result<Vec<(String, String)>> {
-    let mut probed = probe_audio_file(file_path)?;
+    let mut probed = probe_audio_file(fs_node.path.clone())?;
     let mut format = probed.format;
     let mut metadata_list = Vec::new();
 

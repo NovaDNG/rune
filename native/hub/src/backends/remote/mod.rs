@@ -6,14 +6,15 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info};
-use prost::Message as ProstMessage;
+use rinf::{DartSignal, RustSignal};
 use rustls::ClientConfig;
+use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::{
-    connect_async_tls_with_config, tungstenite::protocol::Message as TungsteniteMessage, Connector,
+    Connector, connect_async_tls_with_config, tungstenite::protocol::Message as TungsteniteMessage,
 };
 use tokio_util::sync::CancellationToken;
 use urlencoding::encode;
@@ -21,28 +22,34 @@ use uuid::Uuid;
 
 use ::database::connection::{connect_fake_main_db, connect_fake_recommendation_db};
 use ::discovery::{
-    client::{select_best_host, CertValidator},
+    client::{CertValidator, select_best_host},
     protocol::DiscoveryService,
     server::PermissionManager,
     url::decode_rnsrv_url,
 };
+use ::fsio::FsIo;
 use ::playback::{player::MockPlayer, sfx_player::SfxPlayer};
 use ::scrobbling::manager::MockScrobblingManager;
 
 use crate::{
-    forward_event_to_remote, implement_rinf_dart_signal_trait,
+    Signal, forward_event_to_remote, implement_rinf_dart_signal_trait,
     messages::*,
     register_remote_handlers,
     server::{api::check_fingerprint, generate_or_load_certificates},
     utils::{
-        nid::get_or_create_node_id, GlobalParams, LocalGuiBroadcaster, ParamsExtractor,
-        RinfRustSignal, RunningMode, TaskTokens,
+        GlobalParams, LocalGuiBroadcaster, ParamsExtractor, RinfRustSignal, RunningMode,
+        TaskTokens, nid::get_or_create_node_id,
     },
-    Signal,
 };
 
-pub trait RinfDartSignal: ProstMessage {
+pub trait RinfDartSignal {
     fn name(&self) -> String;
+    fn decode(x: &[u8]) -> Result<Self>
+    where
+        Self: Sized + for<'a> Deserialize<'a>,
+    {
+        rinf::deserialize(x).map_err(|e| anyhow::anyhow!("Deserialization failed: {e}"))
+    }
 }
 
 for_all_requests0!(implement_rinf_dart_signal_trait);
@@ -101,21 +108,22 @@ impl WebSocketDartBridge {
 
     pub async fn register_handler<T>(&self, msg_type: &str)
     where
-        T: ProstMessage + RinfRustSignal + Default + 'static,
+        T: RinfRustSignal + RustSignal + for<'a> Deserialize<'a> + 'static,
     {
-        let handler_fn = Box::new(
-            move |payload: Vec<u8>| match T::decode(payload.as_slice()) {
-                Ok(decoded) => {
-                    decoded.send();
-                }
-                Err(e) => {
-                    error!("Failed to decode message: {}", e);
-                    CrashResponse {
-                        detail: format!("Failed to decode message: {}", e),
-                    };
-                }
-            },
-        );
+        let handler_fn =
+            Box::new(
+                move |payload: Vec<u8>| match rinf::deserialize::<T>(payload.as_slice()) {
+                    Ok(decoded) => {
+                        decoded.send_signal_to_dart();
+                    }
+                    Err(e) => {
+                        error!("Failed to decode message: {e}");
+                        CrashResponse {
+                            detail: format!("Failed to decode message: {e}"),
+                        };
+                    }
+                },
+            );
 
         self.handlers
             .lock()
@@ -127,15 +135,13 @@ impl WebSocketDartBridge {
         if let Some(handler) = self.handlers.lock().await.get(msg_type) {
             handler(payload);
         } else {
-            error!(
-                "No handler registered for message type in the message bridge: {}",
-                msg_type
-            );
+            error!("No handler registered for message type in the message bridge: {msg_type}");
         }
     }
 
     pub async fn run(
         &mut self,
+        fsio: &FsIo,
         rnsrv_url: &str,
         host: &str,
         config_path: &str,
@@ -149,7 +155,7 @@ impl WebSocketDartBridge {
             encode(host)
         );
 
-        info!("Connecting to {}", host);
+        info!("Connecting to {host}");
 
         match connect_async_tls_with_config(
             url.clone(),
@@ -226,19 +232,18 @@ impl WebSocketDartBridge {
                             message = read.next() => {
                                 match message {
                                     Some(Ok(msg)) => {
-                                        if let TungsteniteMessage::Binary(payload) = msg {
-                                            if let Some((msg_type, msg_payload, _request_id)) = decode_message(&payload) {
-                                                debug!("Received message with type: {}", msg_type);
+                                        if let TungsteniteMessage::Binary(payload) = msg
+                                            && let Some((msg_type, msg_payload, _request_id)) = decode_message(&payload) {
+                                                debug!("Received message with type: {msg_type}");
                                                 if let Some(handler) = handlers.lock().await.get(&msg_type) {
                                                     handler(msg_payload);
                                                 } else {
-                                                    error!("No handler registered for message type while receiving response: {}", msg_type);
+                                                    error!("No handler registered for message type while receiving response: {msg_type}");
                                                 }
                                             }
-                                        }
                                     }
                                     Some(Err(e)) => {
-                                        error!("Error receiving message: {}", e);
+                                        error!("Error receiving message: {e}");
                                         break;
                                     }
                                     None => break,
@@ -248,7 +253,7 @@ impl WebSocketDartBridge {
                                 info!("Received cancel signal, closing connection");
                                 let mut write = write_clone.lock().await;
                                 if let Err(e) = write.close().await {
-                                    error!("Error closing websocket connection: {}", e);
+                                    error!("Error closing websocket connection: {e}");
                                 }
                                 break;
                             }
@@ -265,9 +270,10 @@ impl WebSocketDartBridge {
                     Arc::new(RwLock::new(CertValidator::new(config_path).await.unwrap()));
 
                 info!("Initializing UI events");
-                let node_id = get_or_create_node_id(config_path).await?.to_string();
+                let node_id = get_or_create_node_id(fsio, config_path).await?.to_string();
 
                 let global_params = GlobalParams {
+                    fsio: Arc::new(FsIo::new_noop()),
                     lib_path: Arc::new(rnsrv_url.to_owned()),
                     config_path: Arc::new(config_path.to_string()),
                     node_id: Arc::new(node_id),
@@ -301,8 +307,8 @@ impl WebSocketDartBridge {
                 Ok(())
             }
             Err(e) => {
-                let error_msg = format!("Failed to connect: {}", e);
-                error!("{}", error_msg);
+                let error_msg = format!("Failed to connect: {e}");
+                error!("{error_msg}");
 
                 CrashResponse { detail: error_msg }.send_signal_to_dart();
                 Err(e.into())
@@ -311,7 +317,12 @@ impl WebSocketDartBridge {
     }
 }
 
-pub async fn server_player_loop(url: &str, config_path: &str, alias: &str) -> Result<()> {
+pub async fn server_player_loop(
+    fsio: Arc<FsIo>,
+    url: &str,
+    config_path: &str,
+    alias: &str,
+) -> Result<()> {
     info!("Media Library Received, initialize the server loop");
 
     let cert_validator = Arc::new(
@@ -342,6 +353,7 @@ pub async fn server_player_loop(url: &str, config_path: &str, alias: &str) -> Re
 
     let rnsrv_url = url.to_string();
     let config_path = config_path.to_string();
+    let fsio = Arc::clone(&fsio);
     tokio::spawn(async move {
         info!("Initializing bridge");
         let mut bridge = WebSocketDartBridge::new();
@@ -358,12 +370,19 @@ pub async fn server_player_loop(url: &str, config_path: &str, alias: &str) -> Re
             PlaybackStatus,
             ScrobbleServiceStatusUpdated,
             CrashResponse,
-            RealtimeFft,
+            RealtimeFFT,
             PlaylistUpdate
         );
 
         bridge
-            .run(&rnsrv_url, &host, &config_path, client_config, &fingerprint)
+            .run(
+                &fsio,
+                &rnsrv_url,
+                &host,
+                &config_path,
+                client_config,
+                &fingerprint,
+            )
             .await
     });
 

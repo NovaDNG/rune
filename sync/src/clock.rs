@@ -71,10 +71,10 @@
 //!     let network_exchanger = MyNetworkExchanger;
 //!
 //!     let initial_offset = initial_sync(config, &network_exchanger)?;
-//!     println!("Initial clock offset: {} ns", initial_offset);
+//!     println!("Initial clock offset: {initial_offset} ns");
 //!
 //!     let current_offset = check_offset(&network_exchanger)?;
-//!     println!("Current clock offset: {} ns", current_offset);
+//!     println!("Current clock offset: {current_offset} ns");
 //!
 //!     Ok(())
 //! }
@@ -218,9 +218,9 @@ pub fn initial_sync<T: TimestampExchanger>(
 /// ```rust
 /// use std::time::{Duration, Instant};
 /// use std::thread;
-/// 
+///
 /// use once_cell::sync::Lazy;
-/// 
+///
 /// use crate::sync::clock::{check_offset, CristianError, TimestampExchanger, Timestamp, ClockOffset, PROCESS_START};
 ///
 /// // Mock TimestampExchanger defined directly within the doctest
@@ -290,8 +290,7 @@ fn sample_offset<T: TimestampExchanger>(
                 // This indicates a potential issue with timer resolution, system clock adjustment, or very fast execution.
                 // Depending on requirements, either return an error or a default offset (like 0).
                 return Err(CristianError::ExchangeError(format!(
-                    "Invalid RTT calculation: t2 ({}) <= t1 ({}). System clock issue?",
-                    t2, t1
+                    "Invalid RTT calculation: t2 ({t2}) <= t1 ({t1}). System clock issue?"
                 )));
                 // Or, alternatively, treat RTT as minimal measurable duration if acceptable:
                 // rtt = 1; // Assign a minimum positive RTT, e.g., 1 nanosecond
@@ -391,20 +390,18 @@ mod tests {
             // Check if we should always fail
             if self.fail_always.get() {
                 return Err(CristianError::ExchangeError(format!(
-                    "Simulated always failure on call {}",
-                    current_call_number
+                    "Simulated always failure on call {current_call_number}"
                 )));
             }
 
             // Check if this call should fail
-            if let Some(fail_nth) = self.fail_exchange_nth_call.get() {
-                if current_call_number == fail_nth {
-                    // Check for exact match
-                    return Err(CristianError::ExchangeError(format!(
-                        "Simulated exchange failure on call {}",
-                        current_call_number
-                    )));
-                }
+            if let Some(fail_nth) = self.fail_exchange_nth_call.get()
+                && current_call_number == fail_nth
+            {
+                // Check for exact match
+                return Err(CristianError::ExchangeError(format!(
+                    "Simulated exchange failure on call {current_call_number}"
+                )));
             }
 
             // Simulate network delay
@@ -436,16 +433,10 @@ mod tests {
 
         // Expected offset = server_offset + rtt/2 ≈ 0 + (10ms + overhead)/2 ≈ 5ms + overhead/2
         let expected_offset_ns = (delay_ms * 1_000_000 / 2) as ClockOffset;
-        println!(
-            "No Offset Test - Offset: {} ns, Expected ≈ {} ns",
-            offset, expected_offset_ns
-        );
+        println!("No Offset Test - Offset: {offset} ns, Expected ≈ {expected_offset_ns} ns");
         assert!(
             (offset - expected_offset_ns).abs() < OFFSET_TOLERANCE_NS,
-            "Offset {} not within {} ns of expected {}",
-            offset,
-            OFFSET_TOLERANCE_NS,
-            expected_offset_ns
+            "Offset {offset} not within {OFFSET_TOLERANCE_NS} ns of expected {expected_offset_ns}"
         );
     }
 
@@ -462,16 +453,10 @@ mod tests {
 
         // Expected offset = server_offset + rtt/2 ≈ 10ms + (10ms + overhead)/2 ≈ 15ms + overhead/2
         let expected_offset_ns = server_offset_ns + (delay_ms * 1_000_000 / 2) as ClockOffset;
-        println!(
-            "Positive Offset Test - Offset: {} ns, Expected ≈ {} ns",
-            offset, expected_offset_ns
-        );
+        println!("Positive Offset Test - Offset: {offset} ns, Expected ≈ {expected_offset_ns} ns");
         assert!(
             (offset - expected_offset_ns).abs() < OFFSET_TOLERANCE_NS,
-            "Offset {} not within {} ns of expected {}",
-            offset,
-            OFFSET_TOLERANCE_NS,
-            expected_offset_ns
+            "Offset {offset} not within {OFFSET_TOLERANCE_NS} ns of expected {expected_offset_ns}"
         );
     }
 
@@ -488,16 +473,10 @@ mod tests {
 
         // Expected offset = server_offset + rtt/2 ≈ -10ms + (10ms + overhead)/2 ≈ -5ms + overhead/2
         let expected_offset_ns = server_offset_ns + (delay_ms * 1_000_000 / 2) as ClockOffset;
-        println!(
-            "Negative Offset Test - Offset: {} ns, Expected ≈ {} ns",
-            offset, expected_offset_ns
-        );
+        println!("Negative Offset Test - Offset: {offset} ns, Expected ≈ {expected_offset_ns} ns");
         assert!(
             (offset - expected_offset_ns).abs() < OFFSET_TOLERANCE_NS,
-            "Offset {} not within {} ns of expected {}",
-            offset,
-            OFFSET_TOLERANCE_NS,
-            expected_offset_ns
+            "Offset {offset} not within {OFFSET_TOLERANCE_NS} ns of expected {expected_offset_ns}"
         );
     }
 
@@ -525,10 +504,7 @@ mod tests {
         );
         assert!(
             (offset - expected_offset_ns).abs() < OFFSET_TOLERANCE_NS,
-            "Offset {} not within {} ns of expected {}",
-            offset,
-            OFFSET_TOLERANCE_NS,
-            expected_offset_ns
+            "Offset {offset} not within {OFFSET_TOLERANCE_NS} ns of expected {expected_offset_ns}"
         );
         // Verify failure only happened once
         assert_eq!(
@@ -546,7 +522,7 @@ mod tests {
 
         println!("Running initial_sync expecting all failures...");
         let result = initial_sync(config, &exchanger);
-        println!("Result: {:?}", result);
+        println!("Result: {result:?}");
 
         assert!(
             result.is_err(),
@@ -555,7 +531,7 @@ mod tests {
 
         match result.unwrap_err() {
             CristianError::NoValidTimestamps => {}
-            e => panic!("Expected NoValidTimestamps error, got {:?}", e),
+            e => panic!("Expected NoValidTimestamps error, got {e:?}"),
         }
 
         // Check that the loop still tried num_samples times
@@ -579,16 +555,10 @@ mod tests {
 
         // Expected offset = server_offset + rtt/2 ≈ 5ms + (20ms + overhead)/2 ≈ 15ms + overhead/2
         let expected_offset_ns = server_offset_ns + (delay_ms * 1_000_000 / 2) as ClockOffset;
-        println!(
-            "Check Offset Test - Offset: {} ns, Expected ≈ {} ns",
-            offset, expected_offset_ns
-        );
+        println!("Check Offset Test - Offset: {offset} ns, Expected ≈ {expected_offset_ns} ns");
         assert!(
             (offset - expected_offset_ns).abs() < OFFSET_TOLERANCE_NS,
-            "Offset {} not within {} ns of expected {}",
-            offset,
-            OFFSET_TOLERANCE_NS,
-            expected_offset_ns
+            "Offset {offset} not within {OFFSET_TOLERANCE_NS} ns of expected {expected_offset_ns}"
         );
     }
 
@@ -650,11 +620,11 @@ mod tests {
         let mut triggered_error = false;
         for _ in 0..10 {
             let result = sample_offset(&exchanger);
-            if let Err(CristianError::ExchangeError(msg)) = result {
-                if msg.contains("Invalid RTT calculation") {
-                    triggered_error = true;
-                    break;
-                }
+            if let Err(CristianError::ExchangeError(msg)) = result
+                && msg.contains("Invalid RTT calculation")
+            {
+                triggered_error = true;
+                break;
             }
             // Add a small delay to increase chance of Instant::now() difference
             std::thread::sleep(Duration::from_nanos(10));

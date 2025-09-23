@@ -25,22 +25,35 @@ pub struct PlayerStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OnlineInLibraryFile {
+    pub host: String,
+    pub fingerprint: String,
+    pub id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PlayingItem {
     InLibrary(i32),
-    IndependentFile(PathBuf),
+    /// This is the raw content, on native platform it
+    /// is the path, on Android, it is the Content URI
+    IndependentFile(String),
+    // The second parameter is the media_file id in the
+    // library, if the file comes from the library,
+    // the cover art resolving module need a different
+    // code path
+    Online(String, Option<OnlineInLibraryFile>),
     Unknown,
 }
 
 impl fmt::Display for PlayingItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PlayingItem::InLibrary(id) => write!(f, "PlayingItem::InLibrary({})", id),
+            PlayingItem::InLibrary(id) => write!(f, "PlayingItem::InLibrary({id})"),
             PlayingItem::IndependentFile(path) => {
-                write!(
-                    f,
-                    "PlayingItem::IndependentFile({})",
-                    path.to_string_lossy()
-                )
+                write!(f, "PlayingItem::IndependentFile({path})")
+            }
+            PlayingItem::Online(url, remote_file) => {
+                write!(f, "PlayingItem::Online({url}::{remote_file:?})")
             }
             PlayingItem::Unknown => write!(f, "PlayingItem::Unknown()"),
         }
@@ -72,7 +85,7 @@ impl std::fmt::Display for PlaybackState {
             PlaybackState::Paused => "Paused",
             PlaybackState::Stopped => "Stopped",
         };
-        write!(f, "{}", state_str)
+        write!(f, "{state_str}")
     }
 }
 
@@ -158,7 +171,7 @@ impl Player {
             volume: 1.0,
         }));
 
-        let commands = Arc::new(Mutex::new(cmd_tx));
+        let commands = Arc::new(Mutex::new(cmd_tx.clone()));
         // Create the Player instance and wrap the command sender in Arc<Mutex>
         let player = Player {
             commands: commands.clone(),
@@ -176,15 +189,19 @@ impl Player {
         let internal_cancellation_token = cancellation_token.clone();
         thread::spawn(move || {
             // Create a PlayerInternal instance, passing in the command receiver and event sender
-            let mut internal =
-                PlayerInternal::new(cmd_rx, event_sender, internal_cancellation_token.clone());
+            let mut internal = PlayerInternal::new(
+                cmd_rx,
+                event_sender,
+                internal_cancellation_token.clone(),
+                cmd_tx.clone(),
+            );
             // Create a new Tokio runtime for asynchronous tasks
             let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
             // Run the main loop of PlayerInternal within the Tokio runtime
             if let Err(e) = runtime.block_on(internal.run()) {
-                error!("PlayerInternal runtime error: {:?}", e);
+                error!("PlayerInternal runtime error: {e:?}");
 
-                crash_sender.send(format!("{:#?}", e));
+                crash_sender.send(format!("{e:#?}"));
             }
         });
 
@@ -240,7 +257,7 @@ impl Player {
                         status.position = position;
                         status.state = PlaybackState::Paused;
                     }
-                    PlayerEvent::Stopped {} => {
+                    PlayerEvent::Stopped => {
                         status.item = None;
                         status.index = None;
                         status.path = None;
@@ -286,10 +303,7 @@ impl Player {
                         path,
                         error,
                     } => {
-                        error!(
-                            "Error at index {}({:?}): {:?} - {}",
-                            index, item, path, error
-                        );
+                        error!("Error at index {index}({item:?}): {path:?} - {error}");
                     }
                     PlayerEvent::PlaylistUpdated(playlist) => {
                         status.playlist = playlist.clone();
@@ -320,7 +334,7 @@ impl Player {
         // Acquire the lock and send the command
         if let Ok(commands) = self.commands.lock() {
             if let Err(e) = commands.send(cmd) {
-                error!("Failed to send command: {:?}", e);
+                error!("Failed to send command: {e:?}");
             }
         } else {
             error!("Failed to lock commands for sending");

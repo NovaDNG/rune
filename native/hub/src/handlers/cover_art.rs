@@ -3,16 +3,19 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::future::join_all;
 
-use database::connection::MainDbConnection;
-use database::connection::RecommendationDbConnection;
-use database::playing_item::dispatcher::PlayingItemActionDispatcher;
 use tokio::task;
 
-use crate::utils::query_cover_arts;
-use crate::utils::GlobalParams;
-use crate::utils::ParamsExtractor;
-use crate::Session;
-use crate::{messages::*, Signal};
+use ::database::{
+    connection::{MainDbConnection, RecommendationDbConnection},
+    playing_item::dispatcher::PlayingItemActionDispatcher,
+};
+use ::fsio::FsIo;
+
+use crate::{
+    Session, Signal,
+    messages::*,
+    utils::{GlobalParams, ParamsExtractor, query_cover_arts},
+};
 
 impl ParamsExtractor for GetCoverArtIdsByMixQueriesRequest {
     type Params = (Arc<MainDbConnection>, Arc<RecommendationDbConnection>);
@@ -42,7 +45,8 @@ impl Signal for GetCoverArtIdsByMixQueriesRequest {
             let recommend_db = Arc::clone(&recommend_db);
             async move {
                 let query =
-                    query_cover_arts(&main_db, recommend_db, x.queries, Some(request.n)).await;
+                    query_cover_arts(&main_db, recommend_db, x.queries.clone(), Some(request.n))
+                        .await;
 
                 match query {
                     Ok(files) => {
@@ -71,20 +75,24 @@ impl Signal for GetCoverArtIdsByMixQueriesRequest {
 }
 
 impl ParamsExtractor for GetPrimaryColorByTrackIdRequest {
-    type Params = (Arc<MainDbConnection>,);
+    type Params = (Arc<FsIo>, Arc<String>, Arc<MainDbConnection>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
-        (Arc::clone(&all_params.main_db),)
+        (
+            Arc::clone(&all_params.fsio),
+            Arc::clone(&all_params.lib_path),
+            Arc::clone(&all_params.main_db),
+        )
     }
 }
 
 impl Signal for GetPrimaryColorByTrackIdRequest {
-    type Params = (Arc<MainDbConnection>,);
+    type Params = (Arc<FsIo>, Arc<String>, Arc<MainDbConnection>);
     type Response = GetPrimaryColorByTrackIdResponse;
 
     async fn handle(
         &self,
-        (main_db,): Self::Params,
+        (fsio, lib_path, main_db): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -97,16 +105,21 @@ impl Signal for GetPrimaryColorByTrackIdRequest {
                 runtime.block_on(async move {
                     let dispatcher = PlayingItemActionDispatcher::new();
                     let primary_color = dispatcher
-                        .get_cover_art_primary_color(&main_db, &item.clone().into())
+                        .get_cover_art_primary_color(
+                            &fsio,
+                            lib_path.as_ref().as_ref(),
+                            &main_db,
+                            &item.clone().into(),
+                        )
                         .await;
 
                     match primary_color {
                         Some(x) => GetPrimaryColorByTrackIdResponse {
-                            item: Some(item),
+                            item,
                             primary_color: Some(x),
                         },
                         None => GetPrimaryColorByTrackIdResponse {
-                            item: Some(item),
+                            item,
                             primary_color: None,
                         },
                     }

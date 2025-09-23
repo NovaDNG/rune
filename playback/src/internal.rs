@@ -1,17 +1,23 @@
-use std::fs::File;
-use std::io::BufReader;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt::Debug,
+    fs::File,
+    io::BufReader,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, error, info, warn};
-use rodio::source::SeekError;
-use rodio::{Decoder, PlayError, Sink, Source};
-use tokio::sync::mpsc;
-use tokio::time::{interval, sleep_until, Duration, Instant};
+use rodio::{Decoder, PlayError, Sink, Source, source::SeekError};
+use stream_download::{StreamDownload, storage::temp::TempStorageProvider};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, interval, sleep_until},
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::buffered::rune_buffered;
+use crate::buffered::{RuneBuffered, rune_buffered};
 use crate::output_stream::{RuneOutputStream, RuneOutputStreamHandle};
 use crate::player::PlayingItem;
 use crate::realtime_fft::RealTimeFFT;
@@ -20,6 +26,77 @@ use crate::strategies::{
     AddMode, PlaybackStrategy, RepeatAllStrategy, RepeatOneStrategy, SequentialStrategy,
     ShuffleStrategy, UpdateReason,
 };
+
+pub enum AnySource {
+    Local(RuneBuffered<Decoder<BufReader<File>>>),
+    Online(RuneBuffered<Decoder<StreamDownload<TempStorageProvider>>>),
+}
+
+impl Debug for AnySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnySource::Local(_) => f.debug_struct("AnySource::Local").finish(),
+            AnySource::Online(_) => f.debug_struct("AnySource::Online").finish(),
+        }
+    }
+}
+
+impl AnySource {
+    fn current_samples(&self) -> Option<Vec<i16>> {
+        match self {
+            AnySource::Local(s) => s.current_samples(),
+            AnySource::Online(s) => s.current_samples(),
+        }
+    }
+}
+
+impl Iterator for AnySource {
+    type Item = i16;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            AnySource::Local(s) => s.next(),
+            AnySource::Online(s) => s.next(),
+        }
+    }
+}
+
+impl Source for AnySource {
+    fn current_frame_len(&self) -> Option<usize> {
+        match self {
+            AnySource::Local(s) => s.current_frame_len(),
+            AnySource::Online(s) => s.current_frame_len(),
+        }
+    }
+
+    fn channels(&self) -> u16 {
+        match self {
+            AnySource::Local(s) => s.channels(),
+            AnySource::Online(s) => s.channels(),
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            AnySource::Local(s) => s.sample_rate(),
+            AnySource::Online(s) => s.sample_rate(),
+        }
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        match self {
+            AnySource::Local(s) => s.total_duration(),
+            AnySource::Online(s) => s.total_duration(),
+        }
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        match self {
+            AnySource::Local(s) => s.try_seek(pos),
+            AnySource::Online(s) => s.try_seek(pos),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackMode {
@@ -56,6 +133,13 @@ impl From<PlaybackMode> for u32 {
 pub enum PlayerCommand {
     Load {
         index: usize,
+    },
+    LoadComplete {
+        result: Box<Result<AnySource>>,
+        item: PlayingItem,
+        index: usize,
+        path: PathBuf,
+        play: bool,
     },
     Play,
     Pause,
@@ -144,6 +228,7 @@ enum InternalPlaybackState {
     Playing,
     Paused,
     Stopped,
+    Loading,
 }
 
 fn try_new_sink(stream: &RuneOutputStreamHandle) -> Result<Sink, PlayError> {
@@ -158,7 +243,11 @@ pub struct InternalLog {
     pub error: String,
 }
 
-impl Source for SharedSource {
+impl<S> Source for SharedSource<S>
+where
+    S: Source,
+    S::Item: rodio::Sample,
+{
     fn current_frame_len(&self) -> Option<usize> {
         self.inner.lock().unwrap().current_frame_len()
     }
@@ -182,6 +271,7 @@ impl Source for SharedSource {
 
 pub(crate) struct PlayerInternal {
     commands: mpsc::UnboundedReceiver<PlayerCommand>,
+    commands_sender: mpsc::UnboundedSender<PlayerCommand>,
     event_sender: mpsc::UnboundedSender<PlayerEvent>,
     realtime_fft: Arc<Mutex<RealTimeFFT>>,
     fft_enabled: Arc<Mutex<bool>>,
@@ -208,10 +298,12 @@ impl PlayerInternal {
         commands: mpsc::UnboundedReceiver<PlayerCommand>,
         event_sender: mpsc::UnboundedSender<PlayerEvent>,
         cancellation_token: CancellationToken,
+        commands_sender: mpsc::UnboundedSender<PlayerCommand>,
     ) -> Self {
         let (stream_error_sender, stream_error_receiver) = mpsc::unbounded_channel();
         Self {
             commands,
+            commands_sender,
             event_sender,
             playlist: Vec::new(),
             current_item: None,
@@ -240,7 +332,7 @@ impl PlayerInternal {
         let fft_receiver = match self.realtime_fft.lock() {
             Ok(fft) => fft.subscribe(),
             Err(e) => {
-                bail!("Failed to lock realtime FFT: {:?}", e);
+                bail!("Failed to lock realtime FFT: {e:?}");
             }
         };
 
@@ -253,35 +345,45 @@ impl PlayerInternal {
                         break;
                     }
 
-                    debug!("Received command: {:?}", cmd);
+                    debug!("Received command: {cmd:?}");
                     match cmd {
-                        PlayerCommand::Load { index } => self.load(Some(index), false, true),
-                        PlayerCommand::Play => self.play(),
-                        PlayerCommand::Pause => self.pause(),
-                        PlayerCommand::Stop => self.stop(),
-                        PlayerCommand::Next => self.next(),
-                        PlayerCommand::Previous => self.previous(),
-                        PlayerCommand::Switch(index) => self.switch(index),
-                        PlayerCommand::Seek(position) => self.seek(position),
+                        PlayerCommand::Load { index } => self.load(Some(index), false, true)?,
+                        PlayerCommand::LoadComplete { result, item, index, path, play } => {
+                            self.state = InternalPlaybackState::Stopped;
+                            match *result {
+                                Ok(source) => {
+                                    self.setup_sink(source, item, index, path, play)?;
+                                }
+                                Err(e) => {
+                                    error!("Failed to load track: {e:?}");
+                                    self.next()?;
+                                }
+                            }
+                        },
+                        PlayerCommand::Play => self.play()?,
+                        PlayerCommand::Pause => self.pause()?,
+                        PlayerCommand::Stop => self.stop()?,
+                        PlayerCommand::Next => self.next()?,
+                        PlayerCommand::Previous => self.previous()?,
+                        PlayerCommand::Switch(index) => self.switch(index)?,
+                        PlayerCommand::Seek(position) => self.seek(position)?,
                         PlayerCommand::AddToPlaylist { tracks, mode } => {
                             self.add_to_playlist(tracks, mode);
-                            Ok(())
                         },
-                        PlayerCommand::RemoveFromPlaylist { index } => self.remove_from_playlist(index),
-                        PlayerCommand::ClearPlaylist => self.clear_playlist(),
+                        PlayerCommand::RemoveFromPlaylist { index } => self.remove_from_playlist(index)?,
+                        PlayerCommand::ClearPlaylist => self.clear_playlist()?,
                         PlayerCommand::MovePlayListItem {old_index, new_index} => {
                             self.move_playlist_item(old_index, new_index);
-                            Ok(())
                         },
-                        PlayerCommand::SetPlaybackMode(mode) => self.set_playback_mode(mode),
-                        PlayerCommand::SetVolume(volume) => self.set_volume(volume),
-                        PlayerCommand::SetRealtimeFFTEnabled(enabled) => self.set_realtime_fft_enabled(enabled),
-                        PlayerCommand::SetAdaptiveSwitchingEnabled(enabled) => self.set_adaptive_switching(enabled),
-                    }?;
+                        PlayerCommand::SetPlaybackMode(mode) => self.set_playback_mode(mode)?,
+                        PlayerCommand::SetVolume(volume) => self.set_volume(volume)?,
+                        PlayerCommand::SetRealtimeFFTEnabled(enabled) => self.set_realtime_fft_enabled(enabled)?,
+                        PlayerCommand::SetAdaptiveSwitchingEnabled(enabled) => self.set_adaptive_switching(enabled)?,
+                    };
                 },
                 Ok(fft_data) = fft_receiver.recv() => {
                     if let Err(e) = self.event_sender.send(PlayerEvent::RealtimeFFT(fft_data)) {
-                        error!("Failed to send FFT data: {:?}", e);
+                        error!("Failed to send FFT data: {e:?}");
                     }
                 },
                 _ = progress_interval.tick() => {
@@ -302,14 +404,14 @@ impl PlayerInternal {
                 },
                 Some(error_message) = self.stream_error_receiver.recv() => {
                     self.stop()?;
-                    error!("Received error message: {}", error_message);
+                    error!("Received error message: {error_message}");
 
                     if self.stream_retry_count < 5 {
                         if let Some(index) = self.current_track_index {
                             self.stream_retry_count += 1;
                             info!("Retrying to load track (attempt {} of 5)", self.stream_retry_count);
                             if let Err(e) = self.load(Some(index), false, true) {
-                                error!("Retry failed: {:?}", e);
+                                error!("Retry failed: {e:?}");
                             }
                         }
                     } else {
@@ -335,128 +437,151 @@ impl PlayerInternal {
     }
 
     fn load(&mut self, index: Option<usize>, play: bool, mapped: bool) -> Result<()> {
+        if self.state == InternalPlaybackState::Loading {
+            warn!("Already loading a track, ignoring new load request.");
+            return Ok(());
+        }
+
         if let Some(index) = index {
-            debug!("Loading track at index: {}", index);
+            self.state = InternalPlaybackState::Loading;
+
             let mapped_index = if mapped {
                 self.get_mapped_track_index(index)
             } else {
                 index
             };
 
-            if mapped_index + 1 > self.playlist.len() {
-                warn!("Index {} exceed the boundary", mapped_index);
+            if mapped_index >= self.playlist.len() {
+                warn!("Index {mapped_index} exceed the boundary");
+                self.state = InternalPlaybackState::Stopped;
                 return Ok(());
             }
 
-            let item = &self.playlist[mapped_index];
-            let file = File::open(item.path.clone())
-                .with_context(|| format!("Failed to open file: {:?}", item.path))?;
-            let source = Decoder::new(BufReader::new(file));
+            let item = self.playlist[mapped_index].clone();
+            let commands_sender = self.commands_sender.clone();
 
-            if let Err(error) = source {
-                warn!("Failed to decode file {:?}: {:#?}", item.path, error);
-                self.next()?;
-                self.event_sender.send(PlayerEvent::Log(InternalLog {
-                    domain: "player::internal::decoder".to_string(),
-                    error: format!("{:#?}", error),
-                }))?;
-                return Ok(());
-            }
-
-            let source = SharedSource::new(rune_buffered(source.unwrap()));
-            let source_for_fft = Arc::clone(&source.inner);
-
-            let (stream, stream_handle) = RuneOutputStream::try_default_with_callback({
-                let error_sender = self.stream_error_sender.clone();
-                move |error| {
-                    let _ = error_sender.send(error.to_string());
-                }
-            })
-            .context("Failed to create output stream")?;
-            let sink = try_new_sink(&stream_handle).context("Failed to create sink")?;
-
-            // Create a channel to transfer FFT data
-            let (fft_tx, mut fft_rx) = mpsc::unbounded_channel();
-
-            // Create a new thread for calculating realtime FFT
-            let realtime_fft = Arc::clone(&self.realtime_fft);
-            let fft_enabled = Arc::clone(&self.fft_enabled);
             tokio::spawn(async move {
-                while let Some(data) = fft_rx.recv().await {
-                    if let Ok(enabled) = fft_enabled.lock() {
-                        if *enabled {
-                            if let Ok(fft) = realtime_fft.lock() {
-                                fft.add_data(data);
-                            }
+                let source_result = async {
+                    match &item.item {
+                        PlayingItem::IndependentFile(_) | PlayingItem::InLibrary(_) => {
+                            let file = File::open(item.path.clone())
+                                .with_context(|| format!("Failed to open file: {:?}", item.path))?;
+                            let decoder = Decoder::new(BufReader::new(file))?;
+                            Ok(AnySource::Local(rune_buffered(decoder)))
+                        }
+                        PlayingItem::Online(url, _) => {
+                            info!("Downloading from url: {url}");
+                            let reader = crate::stream_utils::create_stream_from_url(url).await?;
+                            let decoder = Decoder::new(reader)?;
+                            Ok(AnySource::Online(rune_buffered(decoder)))
+                        }
+                        PlayingItem::Unknown => {
+                            bail!("Cannot load unknown item");
                         }
                     }
+                }
+                .await;
+
+                let cmd = PlayerCommand::LoadComplete {
+                    result: Box::new(source_result),
+                    item: item.item,
+                    index,
+                    path: item.path,
+                    play,
+                };
+                if commands_sender.send(cmd).is_err() {
+                    error!("Failed to send LoadComplete command");
                 }
             });
-
-            sink.set_volume(self.volume);
-            sink.append(source.periodic_access(
-                Duration::from_millis(12),
-                move |_sample: &mut SharedSource| {
-                    if let Ok(guard) = source_for_fft.lock() {
-                        let data: Option<Vec<i16>> = guard.current_samples();
-                        if let Some(data) = data {
-                            if fft_tx.send(data).is_err() {
-                                error!("Failed to send FFT data");
-                            }
-                        }
-                    }
-                },
-            ));
-
-            if !play {
-                sink.pause();
-            }
-
-            self.sink = Some(sink);
-            self._stream = Some(stream);
-            self.current_track_index = Some(index);
-            self.current_item = Some(item.item.clone());
-            self.current_track_path = Some(item.path.clone());
-            info!("Track loaded: {:?}", item.path);
-
-            if play {
-                self.event_sender
-                    .send(PlayerEvent::Playing {
-                        item: self
-                            .current_item
-                            .clone()
-                            .ok_or(anyhow!("Track id unavailable"))?,
-                        index: mapped_index,
-                        path: self
-                            .current_track_path
-                            .clone()
-                            .ok_or(anyhow!("Current track id unavailable"))?,
-                        playback_mode: self.playback_mode,
-                        position: Duration::new(0, 0),
-                    })
-                    .context("Failed to send Playing event")?;
-                self.state = InternalPlaybackState::Playing;
-            } else {
-                self.event_sender
-                    .send(PlayerEvent::Loaded {
-                        item: self
-                            .current_item
-                            .clone()
-                            .ok_or(anyhow!("Track id unavailable"))?,
-                        index: mapped_index,
-                        path: self
-                            .current_track_path
-                            .clone()
-                            .ok_or(anyhow!("Current track id unavailable"))?,
-                        playback_mode: self.playback_mode,
-                        position: Duration::new(0, 0),
-                    })
-                    .context("Failed to send Playing event")?;
-                self.state = InternalPlaybackState::Stopped;
-            }
-        } else {
-            error!("Load command received without index");
         }
+        Ok(())
+    }
+
+    fn setup_sink(
+        &mut self,
+        source: AnySource,
+        item: PlayingItem,
+        index: usize,
+        path: PathBuf,
+        play: bool,
+    ) -> Result<()> {
+        let source = SharedSource::new(source);
+        let source_for_fft = Arc::clone(&source.inner);
+
+        let (stream, stream_handle) = RuneOutputStream::try_default_with_callback({
+            let error_sender = self.stream_error_sender.clone();
+            move |error| {
+                let _ = error_sender.send(error.to_string());
+            }
+        })
+        .context("Failed to create output stream")?;
+        let sink = try_new_sink(&stream_handle).context("Failed to create sink")?;
+
+        let (fft_tx, mut fft_rx) = mpsc::unbounded_channel();
+
+        let realtime_fft = Arc::clone(&self.realtime_fft);
+        let fft_enabled = Arc::clone(&self.fft_enabled);
+        tokio::spawn(async move {
+            while let Some(data) = fft_rx.recv().await {
+                if let Ok(enabled) = fft_enabled.lock()
+                    && *enabled
+                    && let Ok(fft) = realtime_fft.lock()
+                {
+                    fft.add_data(data);
+                }
+            }
+        });
+
+        sink.set_volume(self.volume);
+        sink.append(source.periodic_access(
+            Duration::from_millis(12),
+            move |_sample: &mut SharedSource<_>| {
+                if let Ok(guard) = source_for_fft.lock() {
+                    let data: Option<Vec<i16>> = guard.current_samples();
+                    if let Some(data) = data
+                        && fft_tx.send(data).is_err()
+                    {
+                        error!("Failed to send FFT data");
+                    }
+                }
+            },
+        ));
+
+        if !play {
+            sink.pause();
+        }
+
+        self.sink = Some(sink);
+        self._stream = Some(stream);
+        self.current_track_index = Some(index);
+        self.current_item = Some(item.clone());
+        self.current_track_path = Some(path.clone());
+        info!("Track loaded: {path:?}");
+
+        if play {
+            self.event_sender
+                .send(PlayerEvent::Playing {
+                    item,
+                    index,
+                    path,
+                    playback_mode: self.playback_mode,
+                    position: Duration::new(0, 0),
+                })
+                .context("Failed to send Playing event")?;
+            self.state = InternalPlaybackState::Playing;
+        } else {
+            self.event_sender
+                .send(PlayerEvent::Loaded {
+                    item,
+                    index,
+                    path,
+                    playback_mode: self.playback_mode,
+                    position: Duration::new(0, 0),
+                })
+                .context("Failed to send Playing event")?;
+            self.state = InternalPlaybackState::Stopped;
+        }
+
         Ok(())
     }
 
@@ -484,9 +609,7 @@ impl PlayerInternal {
             }
         } else {
             info!("Loading the first track");
-            self.load(Some(0), true, true)
-                .with_context(|| "Failed to load the first track")?;
-            self.play()?;
+            self.load(Some(0), true, true)?;
         }
 
         Ok(())
@@ -532,8 +655,7 @@ impl PlayerInternal {
     fn next(&mut self) -> Result<()> {
         if let Some(index) = self.current_track_index {
             if let Some(next_index) = self.playback_strategy.next(index, self.playlist.len()) {
-                self.load(Some(next_index), true, true)
-                    .with_context(|| "Failed to load next track")?;
+                self.load(Some(next_index), true, true)?;
             } else {
                 info!("End of playlist reached");
                 self.event_sender
@@ -543,8 +665,7 @@ impl PlayerInternal {
                 if let Some(start_index) =
                     self.playback_strategy.on_playlist_end(self.playlist.len())
                 {
-                    self.load(Some(start_index), false, true)
-                        .with_context(|| "Failed to load track at start index")?;
+                    self.load(Some(start_index), false, true)?;
                 } else {
                     self.stop()?;
                 }
@@ -556,8 +677,7 @@ impl PlayerInternal {
 
     fn do_switch_back(&mut self, index: usize) -> Result<()> {
         if let Some(prev_index) = self.playback_strategy.previous(index, self.playlist.len()) {
-            self.load(Some(prev_index), true, true)
-                .with_context(|| "Failed to load previous track")?;
+            self.load(Some(prev_index), true, true)?;
         } else {
             info!("Beginning of playlist reached");
         }
@@ -572,8 +692,7 @@ impl PlayerInternal {
                     let need_adaptive = sink.get_pos() > Duration::from_secs(3);
 
                     if self.adaptive_switching && need_adaptive {
-                        self.load(Some(index), true, true)
-                            .with_context(|| "Failed to reload track")?;
+                        self.load(Some(index), true, true)?;
                     } else {
                         return self.do_switch_back(index);
                     }
@@ -588,14 +707,10 @@ impl PlayerInternal {
 
     fn switch(&mut self, index: usize) -> Result<()> {
         if index < self.playlist.len() {
-            debug!("Switching to track at index: {}", index);
-            self.load(Some(index), true, false)
-                .with_context(|| "Failed to switch track")?;
+            debug!("Switching to track at index: {}", { index });
+            self.load(Some(index), true, false)?;
         } else {
-            warn!(
-                "Switch command received but index {} is out of bounds",
-                index
-            );
+            warn!("Switch command received but index {index} is out of bounds");
         }
 
         Ok(())
@@ -605,7 +720,7 @@ impl PlayerInternal {
         if let Some(sink) = &self.sink {
             match sink.try_seek(std::time::Duration::from_secs_f64(position)) {
                 Ok(_) => {
-                    info!("Seeking to position: {} s", position);
+                    info!("Seeking to position: {position} s");
 
                     let position = sink.get_pos();
                     if let Some(track_index) = self.current_track_index {
@@ -647,7 +762,7 @@ impl PlayerInternal {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to seek: {:#?}", e);
+                    error!("Failed to seek: {e:#?}");
                 }
             }
         } else {
@@ -658,7 +773,7 @@ impl PlayerInternal {
     }
 
     fn add_to_playlist(&mut self, tracks: Vec<(PlayingItem, std::path::PathBuf)>, mode: AddMode) {
-        debug!("Adding tracks to playlist with mode: {:?}", mode);
+        debug!("Adding tracks to playlist with mode: {:?}", { mode });
         let insert_index = match mode {
             AddMode::PlayNext => {
                 if let Some(current_index) = self.current_track_index {
@@ -700,7 +815,7 @@ impl PlayerInternal {
 
     fn remove_from_playlist(&mut self, index: usize) -> Result<()> {
         if index < self.playlist.len() {
-            debug!("Removing from playlist at index: {}", index);
+            debug!("Removing from playlist at index: {}", { index });
             self.playlist.remove(index);
             self.playback_strategy.on_playlist_updated(
                 self.playlist.len(),
@@ -743,7 +858,7 @@ impl PlayerInternal {
             PlaybackMode::Shuffle => Box::new(ShuffleStrategy::new(self.playlist.len())),
         };
         self.send_progress()?;
-        info!("Playback mode set to {:?}", mode);
+        info!("Playback mode set to {:?}", { mode });
 
         Ok(())
     }
@@ -815,10 +930,7 @@ impl PlayerInternal {
             return;
         }
 
-        debug!(
-            "Moving playlist item from index {} to index {}",
-            old_index, new_index
-        );
+        debug!("Moving playlist item from index {old_index} to index {new_index}");
 
         let item = self.playlist.remove(old_index);
         self.playlist.insert(new_index, item);
@@ -886,7 +998,7 @@ impl PlayerInternal {
     fn set_adaptive_switching(&mut self, x: bool) -> Result<()> {
         self.adaptive_switching = x;
 
-        info!("Adaptive switching status changed: {:#?}", x);
+        info!("Adaptive switching status changed: {:#?}", { x });
 
         Ok(())
     }

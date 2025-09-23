@@ -2,26 +2,26 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use axum::{
-    middleware,
+    Extension, Router, middleware,
     routing::{delete, get, post, put},
-    Extension, Router,
 };
-use axum_server::{tls_rustls::RustlsConfig, Handle};
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use axum_server::{Handle, tls_rustls::RustlsConfig};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use database::actions::cover_art::COVER_TEMP_DIR;
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use log::{error, info};
-use prost::Message;
 use rand::{
+    RngCore,
     distributions::{Alphanumeric, DistString},
-    thread_rng, RngCore,
+    thread_rng,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -30,28 +30,28 @@ use tokio::{
     task::JoinHandle,
 };
 use tower_governor::{
-    governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor, GovernorLayer,
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor,
 };
 
-use ::database::actions::cover_art::COVER_TEMP_DIR;
-use ::discovery::{client::parse_certificate, ssl::generate_self_signed_cert, DiscoveryParams};
+use ::discovery::{DiscoveryParams, client::parse_certificate, ssl::generate_self_signed_cert};
+use ::fsio::FsIo;
 
 use crate::{
+    Signal,
     messages::*,
     server::{
+        AppState, ServerState, WebSocketService,
         http::{
             check_fingerprint::check_fingerprint_handler, device_info::device_info_handler,
-            file::file_handler, list::list_users_handler, panel_alias::update_alias_handler,
+            file::file_handler, list::list_users_handler, media::{get_cover_art_handler, get_media_metadata_handler}, panel_alias::update_alias_handler,
             panel_auth_middleware::auth_middleware, panel_broadcast::toggle_broadcast_handler,
             panel_delete_user::delete_user_handler, panel_login::login_handler,
             panel_refresh::refresh_handler, panel_self::self_handler,
             panel_status::update_user_status_handler, ping::ping_handler,
             register::register_handler, websocket::websocket_handler,
         },
-        AppState, ServerState, WebSocketService,
     },
     utils::{GlobalParams, ParamsExtractor, RinfRustSignal},
-    Signal,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,6 +86,7 @@ pub struct ServerManager {
     certificate: String,
     private_key: String,
     pub jwt_secret: Vec<u8>,
+    pub fsio: Arc<FsIo>,
 }
 
 impl ServerManager {
@@ -103,6 +104,14 @@ impl ServerManager {
             .await
             .context("Failed to initialize JWT secret")?;
 
+        #[cfg(not(target_os = "android"))]
+        let fsio = Arc::new(FsIo::new());
+        #[cfg(target_os = "android")]
+        let fsio = Arc::new(FsIo::new(
+            Path::new(".rune/.android-fs.db"),
+            &global_params.lib_path,
+        )?);
+
         Ok(Self {
             global_params,
             server_handle: Mutex::new(None),
@@ -112,6 +121,7 @@ impl ServerManager {
             certificate,
             private_key,
             jwt_secret,
+            fsio,
         })
     }
 
@@ -146,6 +156,7 @@ impl ServerManager {
             discovery_device_info: Arc::new(RwLock::new(discovery_params.device_info)),
             permission_manager: self.global_params.permission_manager.clone(),
             device_scanner: self.global_params.device_scanner.clone(),
+            fsio: Arc::clone(&self.fsio),
         });
 
         let governor_conf = GovernorConfigBuilder::default()
@@ -189,7 +200,10 @@ impl ServerManager {
             .route("/check-fingerprint", get(check_fingerprint_handler))
             .route("/files/{*file_path}", get(file_handler))
             .route("/device-info", get(device_info_handler))
-            .with_state(server_state);
+            .route("/media/metadata/:id", get(get_media_metadata_handler))
+            .route("/media/cover/:id", get(get_cover_art_handler))
+            .with_state(server_state)
+            .layer(Extension(self.clone()));
 
         info!(
             "Library files path: {}",
@@ -213,14 +227,14 @@ impl ServerManager {
         };
 
         let server_handle = tokio::spawn(async move {
-            info!("Starting secure HTTPS/WSS server on {}", addr);
+            info!("Starting secure HTTPS/WSS server on {addr}");
             let server = axum_server::bind_rustls(addr, tls_config)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>());
 
             match server.await {
                 Ok(_) => info!("Server stopped gracefully"),
-                Err(e) => error!("Server error: {}", e),
+                Err(e) => error!("Server error: {e}"),
             }
         });
 
@@ -286,7 +300,7 @@ impl ServerManager {
 }
 
 pub async fn get_or_generate_alias(config_path: &Path) -> Result<String> {
-    info!("Generating certificate in: {:?}", config_path);
+    info!("Generating certificate in: {config_path:?}");
 
     let certificate_id_path = config_path.join("cid");
     if certificate_id_path.exists() {
@@ -304,10 +318,7 @@ pub async fn get_or_generate_alias(config_path: &Path) -> Result<String> {
 }
 
 pub async fn update_alias(config_path: &Path, new_alias: &str) -> Result<()> {
-    info!(
-        "Updating certificate alias in: {:?} to: {}",
-        config_path, new_alias
-    );
+    info!("Updating certificate alias in: {config_path:?} to: {new_alias}");
 
     let certificate_id_path = config_path.join("cid");
 
@@ -321,7 +332,7 @@ pub async fn update_alias(config_path: &Path, new_alias: &str) -> Result<()> {
 fn generate_random_alias() -> String {
     let mut rng = rand::thread_rng();
     let suffix: String = Alphanumeric.sample_string(&mut rng, 8);
-    format!("R-{}", suffix)
+    format!("R-{suffix}")
 }
 
 pub async fn generate_or_load_certificates<P: AsRef<Path>>(

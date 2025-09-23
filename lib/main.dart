@@ -14,8 +14,8 @@ import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter_fullscreen/flutter_fullscreen.dart';
 
 import 'package:system_tray/system_tray.dart';
-import 'package:flutter_gen/gen_l10n/app_localizations.dart';
 
+import 'l10n/app_localizations.dart';
 import 'utils/l10n.dart';
 import 'utils/locale.dart';
 import 'utils/rune_log.dart';
@@ -46,7 +46,7 @@ import 'widgets/router/rune_with_navigation_bar_and_playback_controllor.dart';
 
 import 'screens/settings_theme/constants/window_sizes.dart';
 
-import 'messages/all.dart';
+import 'bindings/bindings.dart';
 
 import 'constants/configurations.dart';
 
@@ -452,7 +452,7 @@ class RuneLifecycleState extends State<RuneLifecycle> {
             hintPosition: -1,
             initialPlaybackId: -1,
             instantlyPlay: true,
-            operateMode: PlaylistOperateMode.Replace,
+            operateMode: PlaylistOperateMode.replace,
             fallbackPlayingItems: []);
       });
     }

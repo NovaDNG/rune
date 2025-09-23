@@ -1,10 +1,10 @@
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use axum::{
+    Json,
     extract::{ConnectInfo, State},
     http::{Response, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,10 +46,10 @@ pub async fn register_handler(
             .verify_by_fingerprint(&request.fingerprint)
             .await;
 
-        if let Some(user) = user {
-            if user.status == UserStatus::Blocked {
-                return Ok(StatusCode::FORBIDDEN);
-            }
+        if let Some(user) = user
+            && user.status == UserStatus::Blocked
+        {
+            return Ok(StatusCode::FORBIDDEN);
         }
     }
 

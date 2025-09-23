@@ -6,7 +6,7 @@ use discovery::server::{UserStatus, UserSummary};
 pub fn print_permission_table(users: &[UserSummary]) {
     for (i, user) in users.iter().enumerate() {
         let index = i + 1;
-        let index_str = format!("[{}]", index).red().bold();
+        let index_str = format!("[{index}]").red().bold();
         let alias = user.alias.cyan().bold();
         let device_info = format!("{} ({})", user.device_model, user.device_type).blue();
         let fingerprint_short: String = user.fingerprint.chars().take(8).collect();
@@ -17,10 +17,7 @@ pub fn print_permission_table(users: &[UserSummary]) {
             UserStatus::Blocked => "Blocked".red(),
         };
 
-        println!(
-            "{} {} {} {} {}",
-            index_str, alias, device_info, fingerprint, status
-        );
+        println!("{index_str} {alias} {device_info} {fingerprint} {status}");
     }
 }
 

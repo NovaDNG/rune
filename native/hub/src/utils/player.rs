@@ -1,33 +1,37 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use anyhow::{bail, Error};
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result, bail};
 use discovery::server::PermissionManager;
 use log::{debug, error, info};
 use sea_orm::{DatabaseConnection, TransactionTrait};
-use tokio::sync::{Mutex, RwLock};
-use tokio::task;
+use tokio::{
+    sync::{Mutex, RwLock},
+    task,
+};
 
-use ::scrobbling::manager::ScrobblingServiceManager;
-use ::database::actions::logging::insert_log;
-use ::database::actions::playback_queue::replace_playback_queue;
-use ::database::actions::stats::increase_played_through;
-use ::database::connection::MainDbConnection;
-use ::database::playing_item::dispatcher::PlayingItemActionDispatcher;
-use ::database::playing_item::library_item::extract_in_library_ids;
-use ::database::playing_item::PlayingItemMetadataSummary;
+use ::database::{
+    actions::{
+        logging::insert_log, playback_queue::replace_playback_queue, stats::increase_played_through,
+    },
+    connection::MainDbConnection,
+    playing_item::{
+        PlayingItemMetadataSummary, dispatcher::PlayingItemActionDispatcher,
+        library_item::extract_in_library_ids,
+    },
+};
+
 use ::discovery::client::CertValidator;
-use ::playback::controller::get_default_cover_art_path;
-use ::playback::controller::handle_media_control_event;
-use ::playback::controller::MediaControlManager;
-use ::playback::player::PlayingItem;
-use ::playback::player::{Playable, PlaylistStatus};
-use ::playback::MediaMetadata;
-use ::playback::MediaPlayback;
-use ::playback::MediaPosition;
-use ::scrobbling::ScrobblingTrack;
+use ::fsio::FsIo;
+use ::playback::{
+    MediaMetadata, MediaPlayback, MediaPosition,
+    controller::{MediaControlManager, get_default_cover_art_path, handle_media_control_event},
+    player::{Playable, PlayingItem, PlaylistStatus},
+};
+use ::scrobbling::{ScrobblingTrack, manager::ScrobblingServiceManager};
 
 use crate::messages::*;
 use crate::utils::Broadcaster;
@@ -50,7 +54,9 @@ pub fn metadata_summary_to_scrobbling_track(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn initialize_local_player(
+    fsio: Arc<FsIo>,
     lib_path: Arc<String>,
     main_db: Arc<MainDbConnection>,
     player: Arc<Mutex<dyn Playable>>,
@@ -75,6 +81,9 @@ pub async fn initialize_local_player(
     let main_db_for_scrobble_log = Arc::clone(&main_db);
     let main_db_for_player_log = Arc::clone(&main_db);
 
+    let fsio_for_status = Arc::clone(&fsio);
+    let fsio_for_playlist = Arc::clone(&fsio);
+
     let manager = Arc::new(Mutex::new(MediaControlManager::new()?));
 
     let os_controller_receiver = manager.lock().await.subscribe_controller_events();
@@ -98,13 +107,14 @@ pub async fn initialize_local_player(
 
     info!("Initializing event listeners");
     task::spawn(async move {
+        let fsio = Arc::clone(&fsio_for_status);
         let main_db = Arc::clone(&main_db_for_status);
         let mut cached_meta: Option<PlayingItemMetadataSummary> = None;
         let mut cached_cover_art: Option<String> = None;
         let mut last_status_item: Option<PlayingItem> = None;
 
         while let Ok(status) = status_receiver.recv().await {
-            debug!("Player status updated: {:?}", status);
+            debug!("Player status updated: {status:?}");
 
             let item = status.item.clone();
 
@@ -120,7 +130,7 @@ pub async fn initialize_local_player(
                         let cover_art = match dispatcher
                             .lock()
                             .await
-                            .bake_cover_art(&main_db, item_vec)
+                            .bake_cover_art(&fsio, lib_path.as_ref(), &main_db, item_vec)
                             .await
                         {
                             Ok(data) => {
@@ -139,7 +149,7 @@ pub async fn initialize_local_player(
                         match dispatcher
                             .lock()
                             .await
-                            .get_metadata_summary(&main_db, item_vec)
+                            .get_metadata_summary(&fsio, &main_db, item_vec)
                             .await
                         {
                             Ok(metadata) => match metadata.first() {
@@ -158,8 +168,7 @@ pub async fn initialize_local_player(
                                         Ok(_) => {}
                                         Err(e) => {
                                             error!(
-                                                "Error updating OS media controller metadata: {:?}",
-                                                e
+                                                "Error updating OS media controller metadata: {e:?}"
                                             );
                                         }
                                     };
@@ -168,14 +177,14 @@ pub async fn initialize_local_player(
                                     scrobbler.lock().await.update_now_playing_all(track);
                                 }
                                 None => {
-                                    error!("No metadata found for: {:?}", item_clone_for_status);
+                                    error!("No metadata found for: {item_clone_for_status:?}");
                                     cached_meta = None;
                                     last_status_item = Some(item_clone_for_status);
                                 }
                             },
                             Err(e) => {
                                 // Print the error if get_metadata_summary_by_file_id returns an error
-                                error!("Error fetching metadata: {:?}", e);
+                                error!("Error fetching metadata: {e:?}");
                                 cached_meta = None;
                                 last_status_item = Some(item_clone_for_status);
                             }
@@ -206,12 +215,12 @@ pub async fn initialize_local_player(
                 artist: Some(meta.artist.clone()),
                 album: Some(meta.album.clone()),
                 title: Some(meta.title.clone()),
-                duration: Some(meta.duration),
+                duration: meta.duration,
                 item: status.item.map(Into::into),
                 index: status.index.map(|i| i as i32),
                 playback_mode: status.playback_mode.into(),
                 ready: status.ready,
-                cover_art_path: cached_cover_art.clone().unwrap_or_default(),
+                cover_art_path: cached_cover_art.clone(),
                 lib_path: lib_path.as_str().to_string(),
             };
 
@@ -220,10 +229,10 @@ pub async fn initialize_local_player(
                     .await
                     .with_context(|| "Failed to update media controls")
             {
-                error!("{}", e);
+                error!("{e}");
                 e.chain()
                     .skip(1)
-                    .for_each(|cause| eprintln!("because: {}", cause));
+                    .for_each(|cause| eprintln!("because: {cause}"));
             }
 
             broadcaster_for_main.broadcast(&formated_status);
@@ -231,14 +240,15 @@ pub async fn initialize_local_player(
     });
 
     task::spawn(async move {
+        let fsio = Arc::clone(&fsio_for_playlist);
         let main_db = Arc::clone(&main_db_for_playlist);
         let broadcaster = Arc::clone(&broadcaster_for_playlist);
 
         while let Ok(playlist) = playlist_receiver.recv().await {
-            send_playlist_update(&main_db, &playlist, &*broadcaster).await;
+            send_playlist_update(Arc::clone(&fsio), &main_db, &playlist, &*broadcaster).await;
             match replace_playback_queue(&main_db, extract_in_library_ids(playlist.items)).await {
                 Ok(_) => {}
-                Err(e) => error!("Failed to update playback queue record: {:#?}", e),
+                Err(e) => error!("Failed to update playback queue record: {e:#?}"),
             };
         }
     });
@@ -249,23 +259,32 @@ pub async fn initialize_local_player(
         let scrobbler = Arc::clone(&scrobber_for_played_through);
 
         while let Ok(item) = played_through_receiver.recv().await {
-            match item {
+            match &item {
                 PlayingItem::InLibrary(id) => {
-                    if let Err(e) = increase_played_through(&main_db, id)
+                    if let Err(e) = increase_played_through(&main_db, *id)
                         .await
                         .with_context(|| "Unable to update played through count")
                     {
-                        error!("{:?}", e);
+                        error!("{e:?}");
+                    }
+                }
+                PlayingItem::Online(_, Some(online_file)) => {
+                    if let Err(e) = increase_played_through(&main_db, online_file.id)
+                        .await
+                        .with_context(|| "Unable to update played through count")
+                    {
+                        error!("{e:?}");
                     }
                 }
                 PlayingItem::IndependentFile(_) => {}
+                PlayingItem::Online(_, None) => {}
                 PlayingItem::Unknown => {}
             }
 
             let metadata = dispatcher
                 .lock()
                 .await
-                .get_metadata_summary(&main_db, [item].as_ref())
+                .get_metadata_summary(&fsio, &main_db, [item].as_ref())
                 .await;
 
             if let Ok(metadata) = metadata {
@@ -298,7 +317,7 @@ pub async fn initialize_local_player(
 
     task::spawn(async move {
         while let Ok(value) = realtime_fft_receiver.recv().await {
-            broadcaster_for_realtime_fft.broadcast(&RealtimeFft { value });
+            broadcaster_for_realtime_fft.broadcast(&RealtimeFFT { value });
         }
     });
 
@@ -317,18 +336,15 @@ pub async fn initialize_local_player(
                         &txn,
                         database::actions::logging::LogLevel::Error,
                         format!("scrobbler::{:?}::{:?}", error.action, error.service),
-                        format!("{:#?}", error),
+                        format!("{error:#?}"),
                     )
                     .await
                     {
-                        error!("Failed to log scrobbler error: {:#?}", e);
+                        error!("Failed to log scrobbler error: {e:#?}");
                     }
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to start txn while logging scrobbler error: {:#?}",
-                        e
-                    );
+                    error!("Failed to start txn while logging scrobbler error: {e:#?}");
                 }
             }
         }
@@ -348,16 +364,16 @@ pub async fn initialize_local_player(
                     if let Err(e) = insert_log(
                         &txn,
                         database::actions::logging::LogLevel::Error,
-                        error.domain,
-                        format!("{:#?}", error.error),
+                        error.domain.clone(),
+                        format!("{error:#?}"),
                     )
                     .await
                     {
-                        error!("Failed to log player error: {:#?}", e);
+                        error!("Failed to log player error: {e:#?}");
                     }
                 }
                 Err(e) => {
-                    error!("Failed to start txn while logging player error: {:#?}", e);
+                    error!("Failed to start txn while logging player error: {e:#?}");
                 }
             }
         }
@@ -373,7 +389,7 @@ pub async fn initialize_local_player(
             {
                 e.chain()
                     .skip(1)
-                    .for_each(|cause| eprintln!("because: {}", cause));
+                    .for_each(|cause| eprintln!("because: {cause}"));
             };
         }
     });
@@ -399,16 +415,16 @@ pub async fn initialize_local_player(
     task::spawn(async move {
         while let Ok(user) = permission_receiver.recv().await {
             broadcaster_for_permission_manager.broadcast(&IncommingClientPermissionNotification {
-                user: Some(ClientSummary {
+                user: ClientSummary {
                     alias: user.alias,
                     fingerprint: user.fingerprint,
                     device_model: user.device_model,
                     status: match user.status {
-                        discovery::server::UserStatus::Approved => 0,
-                        discovery::server::UserStatus::Pending => 1,
-                        discovery::server::UserStatus::Blocked => 2,
+                        discovery::server::UserStatus::Approved => ClientStatus::Approved,
+                        discovery::server::UserStatus::Pending => ClientStatus::Pending,
+                        discovery::server::UserStatus::Blocked => ClientStatus::Blocked,
                     },
-                }),
+                },
             });
         }
     });
@@ -417,6 +433,7 @@ pub async fn initialize_local_player(
 }
 
 pub async fn send_playlist_update(
+    fsio: Arc<FsIo>,
     db: &DatabaseConnection,
     playlist: &PlaylistStatus,
     broadcaster: &dyn Broadcaster,
@@ -425,7 +442,10 @@ pub async fn send_playlist_update(
 
     let dispatcher = PlayingItemActionDispatcher::new();
 
-    match dispatcher.get_metadata_summary(db, &items.clone()).await {
+    match dispatcher
+        .get_metadata_summary(&fsio, db, &items.clone())
+        .await
+    {
         Ok(summaries) => {
             // Create a HashMap to store summaries by their id
             let summary_map: HashMap<PlayingItem, _> = summaries
@@ -438,7 +458,7 @@ pub async fn send_playlist_update(
                 .into_iter()
                 .filter_map(|id| summary_map.get(&id))
                 .map(|summary| PlaylistItem {
-                    item: Some(summary.item.clone().into()),
+                    item: summary.item.clone().into(),
                     artist: summary.artist.clone(),
                     album: summary.album.clone(),
                     title: summary.title.clone(),
@@ -449,7 +469,7 @@ pub async fn send_playlist_update(
             broadcaster.broadcast(&PlaylistUpdate { items });
         }
         Err(e) => {
-            error!("Error happened while updating playlist: {:?}", e)
+            error!("Error happened while updating playlist: {e:?}")
         }
     }
 }
@@ -477,7 +497,7 @@ async fn update_media_controls_metadata(
 
     match manager.controls.set_metadata(metadata) {
         Ok(x) => x,
-        Err(e) => bail!(Error::msg(format!("Failed to set media metadata: {:?}", e))),
+        Err(e) => bail!(Error::msg(format!("Failed to set media metadata: {e:?}"))),
     };
 
     Ok(())
@@ -506,8 +526,7 @@ async fn update_media_controls_progress(
     match manager.controls.set_playback(playback) {
         Ok(x) => x,
         Err(e) => bail!(Error::msg(format!(
-            "Failed to set media playback status: {:?}",
-            e
+            "Failed to set media playback status: {e:?}"
         ))),
     };
 

@@ -1,11 +1,13 @@
 mod cli;
 
+#[cfg(target_os = "android")]
+use std::path::Path;
 use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use log::info;
 use rustls::crypto::ring::default_provider;
@@ -20,13 +22,14 @@ use cli::{
 use hub::{
     server::{ServerManager, WebSocketService},
     utils::{
-        initialize_databases, nid::get_or_create_node_id, player::initialize_local_player,
-        GlobalParams, RunningMode, TaskTokens,
+        GlobalParams, RunningMode, TaskTokens, initialize_databases, nid::get_or_create_node_id,
+        player::initialize_local_player,
     },
 };
 
 use ::database::connection::{MainDbConnection, RecommendationDbConnection};
 use ::discovery::{client::CertValidator, protocol::DiscoveryService, server::PermissionManager};
+use ::fsio::FsIo;
 use ::playback::{player::Player, sfx_player::SfxPlayer};
 use ::scrobbling::manager::ScrobblingManager;
 
@@ -83,7 +86,7 @@ async fn main() -> Result<()> {
     setup_logging();
 
     if let Err(e) = default_provider().install_default() {
-        bail!(format!("{:#?}", e));
+        bail!(format!("{e:#?}"));
     };
 
     let cli = Cli::parse();
@@ -107,10 +110,15 @@ fn setup_logging() {
 }
 
 async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<Arc<GlobalParams>> {
-    let db_path = format!("{}/.rune", lib_path);
-    let node_id = Arc::new(get_or_create_node_id(config_path).await?.to_string());
+    #[cfg(not(target_os = "android"))]
+    let fsio = Arc::new(FsIo::new());
+    #[cfg(target_os = "android")]
+    let fsio = Arc::new(FsIo::new(Path::new(".rune/.android-fs.db"), &lib_path)?);
 
-    let db_connections = initialize_databases(lib_path, Some(&db_path), &node_id).await?;
+    let db_path = format!("{lib_path}/.rune");
+    let node_id = Arc::new(get_or_create_node_id(&fsio, config_path).await?.to_string());
+
+    let db_connections = initialize_databases(&fsio, lib_path, Some(&db_path), &node_id).await?;
 
     let main_db: Arc<MainDbConnection> = db_connections.main_db;
     let recommend_db: Arc<RecommendationDbConnection> = db_connections.recommend_db;
@@ -140,6 +148,7 @@ async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<A
 
     info!("Initializing Player events");
     tokio::spawn(initialize_local_player(
+        fsio.clone(),
         lib_path.clone(),
         main_db.clone(),
         player.clone(),
@@ -150,6 +159,7 @@ async fn initialize_global_params(lib_path: &str, config_path: &str) -> Result<A
     ));
 
     let global_params = Arc::new(GlobalParams {
+        fsio,
         lib_path,
         config_path,
         node_id,

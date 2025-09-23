@@ -7,7 +7,9 @@ use tokio::sync::Mutex;
 use ::scrobbling::manager::{ScrobblingCredential, ScrobblingManager};
 
 use crate::{
-    messages::*, utils::{GlobalParams, ParamsExtractor}, Session, Signal
+    Session, Signal,
+    messages::*,
+    utils::{GlobalParams, ParamsExtractor},
 };
 
 impl ParamsExtractor for AuthenticateSingleServiceRequest {
@@ -51,7 +53,7 @@ impl Signal for AuthenticateSingleServiceRequest {
                 },
                 Err(e) => AuthenticateSingleServiceResponse {
                     success: false,
-                    error: format!("{:#?}", e).into(),
+                    error: format!("{e:#?}").into(),
                 },
             };
 

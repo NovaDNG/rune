@@ -1,18 +1,22 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result};
 
-use database::actions::cover_art::bake_cover_art_by_media_files;
-use database::actions::metadata::get_metadata_summary_by_files;
-use database::actions::mixes::{
-    add_item_to_mix, create_mix, get_all_mixes, get_mix_by_id, get_mix_queries_by_mix_id,
-    query_mix_media_files, remove_mix, replace_mix_queries, update_mix,
+use ::database::{
+    actions::{
+        cover_art::bake_cover_art_by_media_files,
+        metadata::get_metadata_summary_by_files,
+        mixes::{
+            add_item_to_mix, create_mix, get_all_mixes, get_mix_by_id, get_mix_queries_by_mix_id,
+            query_mix_media_files, remove_mix, replace_mix_queries, update_mix,
+        },
+    },
+    connection::{MainDbConnection, RecommendationDbConnection},
 };
-use database::connection::{MainDbConnection, RecommendationDbConnection};
+use ::fsio::FsIo;
 
-use crate::utils::{parse_media_files, GlobalParams, ParamsExtractor};
-use crate::{messages::*, Session, Signal};
+use crate::utils::{GlobalParams, ParamsExtractor, parse_media_files};
+use crate::{Session, Signal, messages::*};
 
 impl ParamsExtractor for FetchAllMixesRequest {
     type Params = (Arc<MainDbConnection>,);
@@ -90,6 +94,7 @@ impl Signal for CreateMixRequest {
             &main_db,
             &node_id,
             mix.id,
+            &mix.hlc_uuid,
             request
                 .queries
                 .clone()
@@ -102,13 +107,13 @@ impl Signal for CreateMixRequest {
         .with_context(|| "Failed to update replace mix queries while creating")?;
 
         Ok(Some(CreateMixResponse {
-            mix: Some(Mix {
+            mix: Mix {
                 id: mix.id,
                 name: mix.name,
                 group: mix.group,
                 locked: mix.locked,
                 mode: mix.mode.expect("Mix mode not exists"),
-            }),
+            },
         }))
     }
 }
@@ -153,6 +158,7 @@ impl Signal for UpdateMixRequest {
             &main_db,
             &node_id,
             request.mix_id,
+            &mix.hlc_uuid,
             request
                 .queries
                 .clone()
@@ -165,13 +171,13 @@ impl Signal for UpdateMixRequest {
         .with_context(|| "Failed to update replace mix queries while updating")?;
 
         Ok(Some(UpdateMixResponse {
-            mix: Some(Mix {
+            mix: Mix {
                 id: mix.id,
                 name: mix.name,
                 group: mix.group,
                 locked: mix.locked,
                 mode: mix.mode.expect("Mix mode not exists"),
-            }),
+            },
         }))
     }
 }
@@ -244,8 +250,7 @@ impl Signal for AddItemToMixRequest {
         .await
         .with_context(|| {
             format!(
-                "Failed to add item to mix: mix_id={}, operator={}, parameter={}",
-                mix_id, operator, parameter
+                "Failed to add item to mix: mix_id={mix_id}, operator={operator}, parameter={parameter}"
             )
         })?;
 
@@ -278,19 +283,20 @@ impl Signal for GetMixByIdRequest {
             .with_context(|| format!("Failed to get mix by id: {}", request.mix_id))?;
 
         Ok(Some(GetMixByIdResponse {
-            mix: Some(Mix {
+            mix: Mix {
                 id: mix.id,
                 name: mix.name,
                 group: mix.group,
                 locked: mix.locked,
                 mode: mix.mode.expect("Mix mode not exists"),
-            }),
+            },
         }))
     }
 }
 
 impl ParamsExtractor for MixQueryRequest {
     type Params = (
+        Arc<FsIo>,
         Arc<MainDbConnection>,
         Arc<RecommendationDbConnection>,
         Arc<String>,
@@ -298,6 +304,7 @@ impl ParamsExtractor for MixQueryRequest {
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
+            Arc::clone(&all_params.fsio),
             Arc::clone(&all_params.main_db),
             Arc::clone(&all_params.recommend_db),
             Arc::clone(&all_params.lib_path),
@@ -307,6 +314,7 @@ impl ParamsExtractor for MixQueryRequest {
 
 impl Signal for MixQueryRequest {
     type Params = (
+        Arc<FsIo>,
         Arc<MainDbConnection>,
         Arc<RecommendationDbConnection>,
         Arc<String>,
@@ -315,7 +323,7 @@ impl Signal for MixQueryRequest {
 
     async fn handle(
         &self,
-        (main_db, recommend_db, lib_path): Self::Params,
+        (fsio, main_db, recommend_db, lib_path): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -342,9 +350,9 @@ impl Signal for MixQueryRequest {
             .await
             .with_context(|| "Failed to get media summaries")?;
 
-        let files = parse_media_files(media_summaries, lib_path).await?;
+        let files = parse_media_files(&fsio, media_summaries, lib_path).await?;
         let cover_art_map = if request.bake_cover_arts {
-            bake_cover_art_by_media_files(&main_db, media_entries).await?
+            bake_cover_art_by_media_files(&fsio, &main_db, media_entries).await?
         } else {
             HashMap::new()
         };

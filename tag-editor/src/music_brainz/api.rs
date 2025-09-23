@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use log::{error, warn};
 use reqwest::Client;
 use rusty_chromaprint::Configuration;
@@ -131,11 +131,11 @@ pub async fn identify(
             Ok(results) => return Ok(results),
             Err(e) if attempts < 3 => {
                 attempts += 1;
-                warn!("Attempt {} failed: {}. Retrying...", attempts, e);
+                warn!("Attempt {attempts} failed: {e}. Retrying...");
                 continue;
             }
             Err(e) => {
-                error!("Failed after {} attempts: {}", attempts, e);
+                error!("Failed after {attempts} attempts: {e}");
                 return Err(e);
             }
         }

@@ -1,11 +1,11 @@
 use std::fmt;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
-use sea_orm::prelude::*;
 use sea_orm::ActiveValue;
 use sea_orm::QueryOrder;
+use sea_orm::prelude::*;
 
 use crate::entities::log;
 
@@ -42,7 +42,7 @@ impl fmt::Display for LogLevel {
             LogLevel::Error => "ERROR",
             LogLevel::Debug => "DEBUG",
         };
-        write!(f, "{}", level_str)
+        write!(f, "{level_str}")
     }
 }
 

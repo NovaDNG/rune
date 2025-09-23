@@ -27,23 +27,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "26.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install the Rust dependencies
-        run: cargo install 'flutter_rust_bridge_codegen' rinf protoc-gen-prost
-
-      - name: Activate Protobuf
-        run: flutter pub global activate protoc_plugin
+        run: cargo install rinf_cli
 
       - name: Flutter pub get
         run: flutter pub get
 
       - name: Generate message files
-        run: rinf message
+        run: rinf gen
 
       - name: Build Windows
         run: flutter build windows --release --verbose
@@ -97,23 +88,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "26.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install the Rust dependencies
-        run: cargo install 'flutter_rust_bridge_codegen' rinf protoc-gen-prost
-
-      - name: Activate Protobuf
-        run: flutter pub global activate protoc_plugin
+        run: cargo install rinf_cli
 
       - name: Flutter pub get
         run: flutter pub get
 
       - name: Generate message files
-        run: rinf message
+        run: rinf gen
 
       - name: Build MSIX
         run: dart run msix:create --release
@@ -145,7 +127,7 @@ jobs:
           makeLatest: ${{ !(contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta')) }}
 
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
@@ -161,30 +143,20 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          flutter-version: 3.27.4
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "26.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install the Rust dependencies
-        run: cargo install 'flutter_rust_bridge_codegen' rinf@7.0.1 protoc-gen-prost
-
-      - name: Activate Protobuf
-        run: flutter pub global activate protoc_plugin
+        run: cargo install rinf_cli
 
       - name: Flutter pub get
         run: flutter pub get
 
       - name: Generate message files
-        run: rinf message
+        run: rinf gen
 
       - name: Build linux
         run: flutter build linux --release --verbose
@@ -254,23 +226,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "26.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install the Rust dependencies
-        run: cargo install 'flutter_rust_bridge_codegen' rinf protoc-gen-prost
-
-      - name: Activate Protobuf
-        run: flutter pub global activate protoc_plugin
+        run: cargo install rinf_cli
 
       - name: Flutter pub get
         run: flutter pub get
 
       - name: Generate message files
-        run: rinf message
+        run: rinf gen
 
       - name: Build linux
         run: flutter build linux --release --verbose
@@ -319,7 +282,7 @@ jobs:
           makeLatest: ${{ !(contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta')) }}
 
   build-macos:
-    runs-on: macos-latest
+    runs-on: macos-15
     permissions:
       contents: write
     steps:
@@ -337,12 +300,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "26.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: benjlevesque/short-sha@v3.0
         id: short-sha
@@ -451,7 +408,7 @@ jobs:
           rm -f .env
 
   build-and-release-mac-app-store:
-    runs-on: macos-latest
+    runs-on: macos-15
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout repository
@@ -468,12 +425,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "26.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: benjlevesque/short-sha@v3.0
         id: short-sha
@@ -553,7 +504,7 @@ jobs:
           rm -f .env
           rm -f $RUNNER_TEMP/*.p8
   build-and-release-ios-app-store:
-    runs-on: macos-latest
+    runs-on: macos-15
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout repository

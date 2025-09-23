@@ -40,13 +40,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use blake3::Hasher;
-use chrono::DateTime;
+use chrono::Utc;
 use sea_orm::{
-    entity::prelude::*, Condition, DatabaseConnection, DeleteResult, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    Condition, DatabaseConnection, DeleteResult, FromQueryResult, PaginatorTrait, QueryFilter,
+    QueryOrder, entity::prelude::*,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -105,11 +105,25 @@ impl HLC {
     ///
     /// This is often used as a starting point or default value.
     pub fn new(node_id: Uuid) -> Self {
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let timestamp_ms_u64 = timestamp_ms as u64;
+
         HLC {
-            timestamp_ms: 0,
+            timestamp_ms: timestamp_ms_u64,
             version: 0,
             node_id,
         }
+    }
+
+    pub fn from_node_id_str(node_id: &str) -> Result<Self> {
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let timestamp_ms_u64 = timestamp_ms as u64;
+
+        Ok(HLC {
+            timestamp_ms: timestamp_ms_u64,
+            version: 0,
+            node_id: Uuid::from_str(node_id)?,
+        })
     }
 
     /// Generates a new HLC, ensuring monotonicity.
@@ -131,8 +145,7 @@ impl HLC {
                 if last_hlc.version == u32::MAX {
                     panic!(
                         "HLC counter overflow detected within a single millisecond. Timestamp: {}, Node: {}",
-                        current_timestamp,
-                        context.node_id
+                        current_timestamp, context.node_id
                     );
                 }
                 (current_timestamp, last_hlc.version + 1)
@@ -190,16 +203,18 @@ impl HLC {
     /// use uuid::Uuid;
     ///
     /// let hlc = HLC {
-    ///     timestamp: 1640995200000, // 2022-01-01T00:00:00Z
+    ///     timestamp_ms: 1640995200000, // 2022-01-01T00:00:00Z
     ///     version: 1,
     ///     node_id: Uuid::new_v4(),
     /// };
-    /// assert_eq!(hlc.to_rfc3339(), "2022-01-01T00:00:00+00:00");
+    /// assert_eq!(hlc.to_rfc3339().unwrap(), "2022-01-01T00:00:00.000000000Z");
     /// ```
-    pub fn to_rfc3339(&self) -> String {
-        DateTime::from_timestamp_millis(self.timestamp_ms as i64)
-            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
-            .to_rfc3339()
+    pub fn to_rfc3339(&self) -> Result<String> {
+        use chrono::TimeZone;
+        Utc.timestamp_millis_opt(self.timestamp_ms as i64)
+            .single()
+            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+            .context("HLC timestamp out of range for RFC3339 conversion")
     }
 }
 
@@ -318,9 +333,10 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
 
     /// Creates a SeaORM condition for records strictly greater than the given HLC.
     fn gt(hlc: &HLC) -> Result<Condition> {
-        let ts_str = hlc.to_rfc3339();
+        let ts_str = hlc
+            .to_rfc3339()
+            .with_context(|| format!("Failed to format GT timestamp for HLC {hlc}"))?;
         let ver_val = hlc.version as i32;
-        let nid_str = hlc.node_id.to_string();
 
         Ok(Condition::any()
             // (ts > hlc.ts)
@@ -328,23 +344,17 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
             // OR (ts == hlc.ts AND ver > hlc.ver)
             .add(
                 Condition::all()
-                    .add(Self::updated_at_time_column().eq(ts_str.clone()))
-                    .add(Self::updated_at_version_column().gt(ver_val)),
-            )
-            // OR (ts == hlc.ts AND ver == hlc.ver AND nid > hlc.nid)
-            .add(
-                Condition::all()
                     .add(Self::updated_at_time_column().eq(ts_str))
-                    .add(Self::updated_at_version_column().eq(ver_val))
-                    .add(Self::updated_at_node_id_column().gt(nid_str)),
+                    .add(Self::updated_at_version_column().gt(ver_val)),
             ))
     }
 
     /// Creates a SeaORM condition for records less than the given HLC.
     fn lt(hlc: &HLC) -> Result<Condition> {
-        let ts_str = hlc.to_rfc3339();
+        let ts_str = hlc
+            .to_rfc3339()
+            .with_context(|| format!("Failed to format LT timestamp for HLC {hlc}"))?;
         let ver_val = hlc.version as i32;
-        let nid_str = hlc.node_id.to_string();
 
         Ok(Condition::any()
             // (ts < hlc.ts)
@@ -352,26 +362,45 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
             // OR (ts == hlc.ts AND ver < hlc.ver)
             .add(
                 Condition::all()
-                    .add(Self::updated_at_time_column().eq(ts_str.clone()))
-                    .add(Self::updated_at_version_column().lt(ver_val)),
-            )
-            // OR (ts == hlc.ts AND ver == hlc.ver AND nid < hlc.nid)
-            .add(
-                Condition::all()
                     .add(Self::updated_at_time_column().eq(ts_str))
-                    .add(Self::updated_at_version_column().eq(ver_val))
-                    .add(Self::updated_at_node_id_column().lt(nid_str)),
+                    .add(Self::updated_at_version_column().lt(ver_val)),
             ))
     }
 
     /// Creates a SeaORM condition for records greater than or equal to the given HLC.
     fn gte(hlc: &HLC) -> Result<Condition> {
-        Ok(<Self as HLCModel>::lt(hlc)?.not())
+        let ts_str = hlc
+            .to_rfc3339()
+            .with_context(|| format!("Failed to format GTE timestamp for HLC {hlc}"))?;
+        let ver_val = hlc.version as i32;
+
+        Ok(Condition::any()
+            // (ts > hlc.ts)
+            .add(Self::updated_at_time_column().gt(ts_str.clone()))
+            // OR (ts == hlc.ts AND ver >= hlc.ver)
+            .add(
+                Condition::all()
+                    .add(Self::updated_at_time_column().eq(ts_str))
+                    .add(Self::updated_at_version_column().gte(ver_val)),
+            ))
     }
 
     /// Creates a SeaORM condition for records less than or equal to the given HLC.
     fn lte(hlc: &HLC) -> Result<Condition> {
-        Ok(<Self as HLCModel>::gt(hlc)?.not())
+        let ts_str = hlc
+            .to_rfc3339()
+            .with_context(|| format!("Failed to format LTE timestamp for HLC {hlc}"))?;
+        let ver_val = hlc.version as i32;
+
+        Ok(Condition::any()
+            // (ts < hlc.ts)
+            .add(Self::updated_at_time_column().lt(ts_str.clone()))
+            // OR (ts == hlc.ts AND ver <= hlc.ver)
+            .add(
+                Condition::all()
+                    .add(Self::updated_at_time_column().eq(ts_str))
+                    .add(Self::updated_at_version_column().lte(ver_val)),
+            ))
     }
 
     /// Creates a SeaORM condition for records within the given HLC range (inclusive).
@@ -382,15 +411,6 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
                 start_hlc,
                 end_hlc
             );
-        }
-
-        if start_hlc == end_hlc {
-            // Handle the single HLC case explicitly
-            let ts_str = start_hlc.to_rfc3339();
-            return Ok(Condition::all()
-                .add(Self::updated_at_time_column().eq(ts_str))
-                .add(Self::updated_at_version_column().eq(start_hlc.version as i32))
-                .add(Self::updated_at_node_id_column().eq(start_hlc.node_id.to_string())));
         }
 
         // Handle the range case: >= start AND <= end
@@ -409,7 +429,7 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
             .filter(Self::unique_id_column().eq(unique_id_value))
             .one(db)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to find record by unique ID: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to find record by unique ID: {e}"))
     }
 
     /// Deletes a single record by its unique_id.
@@ -421,7 +441,7 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
             .filter(Self::unique_id_column().eq(unique_id_value))
             .exec(db)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete record by unique ID: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to delete record by unique ID: {e}"))
     }
 }
 
@@ -429,7 +449,7 @@ pub trait HLCModel: EntityTrait + Sized + Send + Sync + 'static {
 mod hlcmodel_tests {
     use crate::{
         chunking::tests::test_model_def::Entity,
-        hlc::{create_hlc, HLCModel, HLC},
+        hlc::{HLC, HLCModel, create_hlc},
     };
     use anyhow::Result;
     use sea_orm::{Condition, DbBackend, EntityTrait, QueryFilter, QueryTrait, Statement, Value};
@@ -498,7 +518,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_gt() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let expected_ts_str = hlc.to_rfc3339();
+        let expected_ts_str = hlc.to_rfc3339()?;
         let expected_version = hlc.version as i32;
 
         let condition = Entity::gt(&hlc)?;
@@ -509,10 +529,10 @@ mod hlcmodel_tests {
         let expected_sql = r#"("mock_tasks"."updated_at_hlc_ts" > ?) OR ("mock_tasks"."updated_at_hlc_ts" = ? AND "mock_tasks"."updated_at_hlc_v" > ?)"#;
         let expected_vals = expected_values(&expected_ts_str, expected_version);
 
-        println!("Generated SQL WHERE (GT): {}", sql_where);
-        println!("Generated Values (GT): {:?}", values);
-        println!("Expected SQL: {}", expected_sql);
-        println!("Expected Values: {:?}", expected_vals);
+        println!("Generated SQL WHERE (GT): {sql_where}");
+        println!("Generated Values (GT): {values:?}");
+        println!("Expected SQL: {expected_sql}");
+        println!("Expected Values: {expected_vals:?}");
 
         assert_eq!(
             normalize_sql(&sql_where),
@@ -528,7 +548,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_lt() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let expected_ts_str = hlc.to_rfc3339();
+        let expected_ts_str = hlc.to_rfc3339()?;
         let expected_version = hlc.version as i32;
 
         let condition = Entity::lt(&hlc)?;
@@ -537,10 +557,10 @@ mod hlcmodel_tests {
         let expected_sql = r#"("mock_tasks"."updated_at_hlc_ts" < ?) OR ("mock_tasks"."updated_at_hlc_ts" = ? AND "mock_tasks"."updated_at_hlc_v" < ?)"#;
         let expected_vals = expected_values(&expected_ts_str, expected_version);
 
-        println!("Generated SQL WHERE (LT): {}", sql_where);
-        println!("Generated Values (LT): {:?}", values);
-        println!("Expected SQL: {}", expected_sql);
-        println!("Expected Values: {:?}", expected_vals);
+        println!("Generated SQL WHERE (LT): {sql_where}");
+        println!("Generated Values (LT): {values:?}");
+        println!("Expected SQL: {}", { expected_sql });
+        println!("Expected Values: {expected_vals:?}");
 
         assert_eq!(
             normalize_sql(&sql_where),
@@ -556,7 +576,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_gte() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let expected_ts_str = hlc.to_rfc3339();
+        let expected_ts_str = hlc.to_rfc3339()?;
         let expected_version = hlc.version as i32;
 
         let condition = Entity::gte(&hlc)?;
@@ -565,10 +585,10 @@ mod hlcmodel_tests {
         let expected_sql = r#"("mock_tasks"."updated_at_hlc_ts" > ?) OR ("mock_tasks"."updated_at_hlc_ts" = ? AND "mock_tasks"."updated_at_hlc_v" >= ?)"#;
         let expected_vals = expected_values(&expected_ts_str, expected_version);
 
-        println!("Generated SQL WHERE (GTE): {}", sql_where);
-        println!("Generated Values (GTE): {:?}", values);
-        println!("Expected SQL: {}", expected_sql);
-        println!("Expected Values: {:?}", expected_vals);
+        println!("Generated SQL WHERE (GTE): {sql_where}");
+        println!("Generated Values (GTE): {values:?}");
+        println!("Expected SQL: {expected_sql}");
+        println!("Expected Values: {expected_vals:?}");
 
         assert_eq!(
             normalize_sql(&sql_where),
@@ -584,7 +604,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_lte() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let expected_ts_str = hlc.to_rfc3339();
+        let expected_ts_str = hlc.to_rfc3339()?;
         let expected_version = hlc.version as i32;
 
         let condition = Entity::lte(&hlc)?;
@@ -593,10 +613,10 @@ mod hlcmodel_tests {
         let expected_sql = r#"("mock_tasks"."updated_at_hlc_ts" < ?) OR ("mock_tasks"."updated_at_hlc_ts" = ? AND "mock_tasks"."updated_at_hlc_v" <= ?)"#;
         let expected_vals = expected_values(&expected_ts_str, expected_version);
 
-        println!("Generated SQL WHERE (LTE): {}", sql_where);
-        println!("Generated Values (LTE): {:?}", values);
-        println!("Expected SQL: {}", expected_sql);
-        println!("Expected Values: {:?}", expected_vals);
+        println!("Generated SQL WHERE (LTE): {sql_where}");
+        println!("Generated Values (LTE): {values:?}");
+        println!("Expected SQL: {expected_sql}");
+        println!("Expected Values: {expected_vals:?}");
 
         assert_eq!(
             normalize_sql(&sql_where),
@@ -613,8 +633,8 @@ mod hlcmodel_tests {
         let node_id = Uuid::new_v4();
         let start_hlc = create_hlc(1678886400000, 1, &node_id.to_string());
         let end_hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let start_ts_str = start_hlc.to_rfc3339();
-        let end_ts_str = end_hlc.to_rfc3339();
+        let start_ts_str = start_hlc.to_rfc3339()?;
+        let end_ts_str = end_hlc.to_rfc3339()?;
         let start_version = start_hlc.version as i32;
         let end_version = end_hlc.version as i32;
 
@@ -628,10 +648,10 @@ mod hlcmodel_tests {
         let expected_vals =
             expected_between_values(&start_ts_str, start_version, &end_ts_str, end_version);
 
-        println!("Generated SQL WHERE (Between): {}", sql_where);
-        println!("Generated Values (Between): {:?}", values);
-        println!("Expected SQL: {}", expected_sql);
-        println!("Expected Values: {:?}", expected_vals);
+        println!("Generated SQL WHERE (Between): {sql_where}");
+        println!("Generated Values (Between): {values:?}");
+        println!("Expected SQL: {expected_sql}");
+        println!("Expected Values: {expected_vals:?}");
 
         assert_eq!(
             normalize_sql(&sql_where),
@@ -647,7 +667,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_between_same_hlc() -> Result<()> {
         let node_id = Uuid::new_v4();
         let hlc = create_hlc(1678886400123, 5, &node_id.to_string());
-        let ts_str = hlc.to_rfc3339();
+        let ts_str = hlc.to_rfc3339()?;
         let version = hlc.version as i32;
 
         let condition = Entity::between(&hlc, &hlc)?;
@@ -656,10 +676,10 @@ mod hlcmodel_tests {
         let expected_sql = r#"(("mock_tasks"."updated_at_hlc_ts" > ?) OR ("mock_tasks"."updated_at_hlc_ts" = ? AND "mock_tasks"."updated_at_hlc_v" >= ?)) AND (("mock_tasks"."updated_at_hlc_ts" < ?) OR ("mock_tasks"."updated_at_hlc_ts" = ? AND "mock_tasks"."updated_at_hlc_v" <= ?))"#;
         let expected_vals = expected_between_values(&ts_str, version, &ts_str, version);
 
-        println!("Generated SQL WHERE (Between Same HLC): {}", sql_where);
-        println!("Generated Values (Between Same HLC): {:?}", values);
-        println!("Expected SQL: {}", expected_sql);
-        println!("Expected Values: {:?}", expected_vals);
+        println!("Generated SQL WHERE (Between Same HLC): {sql_where}");
+        println!("Generated Values (Between Same HLC): {values:?}");
+        println!("Expected SQL: {}", { expected_sql });
+        println!("Expected Values: {expected_vals:?}");
 
         assert_eq!(
             normalize_sql(&sql_where),
@@ -691,7 +711,7 @@ mod hlcmodel_tests {
     fn test_hlcmodel_timestamp_conversion_error() {
         let node_id = Uuid::new_v4();
         let invalid_hlc = HLC {
-            timestamp_ms: u64::MAX, // Known out-of-range value for chrono
+            timestamp_ms: i64::MAX as u64 + 1, // This will wrap around and be a large positive u64, but invalid as i64
             version: 0,
             node_id,
         };
@@ -700,32 +720,19 @@ mod hlcmodel_tests {
 
         assert!(result.is_err());
         let err = result.err().unwrap();
-        let top_level_msg = err.to_string(); // Message potentially including context
+        let top_level_msg = err.to_string();
 
-        println!("Timestamp conversion error message: {}", top_level_msg);
-        println!("Timestamp conversion error chain: {:?}", err); // Print full chain for debugging
-
-        // Check the context message added by with_context() which is reliable
         assert!(
             top_level_msg.contains(&format!(
-                "Failed to format GT timestamp for HLC {}",
-                invalid_hlc
+                "Failed to format GT timestamp for HLC {invalid_hlc}"
             )),
             "Error message should contain the context added in HLCModel::gt"
         );
 
-        // Check the root cause message. This depends on the exact error from hlc_timestamp_millis_to_rfc3339
-        // It might be "timestamp out of range", "value too large", etc.
-        // Make the check more general or adapt to the specific message if known.
         let root_cause_msg = err.root_cause().to_string();
-        println!("Root cause: {}", root_cause_msg);
         assert!(
-            // Check for common keywords related to range errors
-            root_cause_msg.contains("out of range")
-                || root_cause_msg.contains("invalid")
-                || root_cause_msg.contains("value too large"),
-            "Root cause should indicate an out-of-range or invalid timestamp. Root cause: {}",
-            root_cause_msg
+            root_cause_msg.contains("out of range"),
+            "Root cause should indicate an out-of-range timestamp. Root cause: {root_cause_msg}"
         );
     }
 }
@@ -1144,7 +1151,7 @@ mod hlc_from_str_tests {
     #[test]
     fn test_from_str_valid() -> Result<()> {
         let node_id = Uuid::new_v4();
-        let hlc_string = format!("1234567890123-0000abcd-{}", node_id);
+        let hlc_string = format!("1234567890123-0000abcd-{node_id}");
         let hlc = HLC::from_str(&hlc_string)?;
 
         assert_eq!(hlc.timestamp_ms, 1234567890123);
@@ -1165,7 +1172,7 @@ mod hlc_from_str_tests {
     #[test]
     fn test_from_str_invalid_timestamp() {
         let node_id = Uuid::new_v4();
-        let hlc_string = format!("not_a_number-0000abcd-{}", node_id);
+        let hlc_string = format!("not_a_number-0000abcd-{node_id}");
         let result = HLC::from_str(&hlc_string);
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
@@ -1176,7 +1183,7 @@ mod hlc_from_str_tests {
     #[test]
     fn test_from_str_invalid_counter() {
         let node_id = Uuid::new_v4();
-        let hlc_string = format!("1234567890123-not_hex-{}", node_id);
+        let hlc_string = format!("1234567890123-not_hex-{node_id}");
         let result = HLC::from_str(&hlc_string);
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
@@ -1188,12 +1195,12 @@ mod hlc_from_str_tests {
     fn test_from_str_invalid_counter_format_length() {
         // Valid hex, but format might imply fixed length (though not enforced by parse)
         let node_id = Uuid::new_v4();
-        let hlc_string = format!("1234567890123-abc-{}", node_id); // Shorter hex than usual
+        let hlc_string = format!("1234567890123-abc-{node_id}"); // Shorter hex than usual
         let hlc = HLC::from_str(&hlc_string).unwrap(); // Should still parse
         assert_eq!(hlc.version, 0xabc);
 
         // Test hex with > 8 chars (overflows u32)
-        let hlc_string_overflow = format!("1234567890123-100000000-{}", node_id);
+        let hlc_string_overflow = format!("1234567890123-100000000-{node_id}");
         let result = HLC::from_str(&hlc_string_overflow);
         assert!(result.is_err()); // Error comes from u32::from_str_radix
         let err_msg = result.err().unwrap().to_string();

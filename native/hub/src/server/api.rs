@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use http_body_util::{BodyExt, Empty, Full};
-use hyper::{body::Bytes, Method, Request, StatusCode, Uri};
-use rustls::ClientConfig;
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use urlencoding::encode;
 
-use ::discovery::request::{create_https_client, send_http_request};
+use ::http_request::{
+    BodyExt, Bytes, ClientConfig, Empty, Full, Method, Request, StatusCode, Uri,
+    create_https_client, send_http_request,
+};
 
 use super::utils::device::SanitizedDeviceInfo;
 
@@ -17,7 +17,7 @@ pub async fn fetch_device_info(
 ) -> Result<SanitizedDeviceInfo> {
     let uri = Uri::builder()
         .scheme("https")
-        .authority(format!("{}:7863", host))
+        .authority(format!("{host}:7863"))
         .path_and_query("/device-info")
         .build()
         .context("Invalid URL format")?;
@@ -69,7 +69,7 @@ pub async fn register_device(
 ) -> Result<()> {
     let uri = Uri::builder()
         .scheme("https")
-        .authority(format!("{}:7863", host))
+        .authority(format!("{host}:7863"))
         .path_and_query("/register")
         .build()
         .context("Invalid URL format")?;
@@ -129,7 +129,7 @@ pub async fn check_fingerprint(
 ) -> Result<CheckFingerprintResponse> {
     let uri = Uri::builder()
         .scheme("https")
-        .authority(format!("{}:7863", host))
+        .authority(format!("{host}:7863"))
         .path_and_query(format!(
             "/check-fingerprint?fingerprint={}",
             encode(fingerprint)

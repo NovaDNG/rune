@@ -28,10 +28,10 @@ class LargeScreenPlayingTrack extends StatelessWidget {
     return Selector<PlaybackStatusProvider,
         (String, String, String, String, double, PlayingItem?)>(
       selector: (context, playbackStatusProvider) => (
-        playbackStatusProvider.playbackStatus.coverArtPath,
-        playbackStatusProvider.playbackStatus.artist,
-        playbackStatusProvider.playbackStatus.album,
-        playbackStatusProvider.playbackStatus.title,
+        playbackStatusProvider.playbackStatus.coverArtPath ?? "",
+        playbackStatusProvider.playbackStatus.artist ?? "",
+        playbackStatusProvider.playbackStatus.album ?? "",
+        playbackStatusProvider.playbackStatus.title ?? "",
         playbackStatusProvider.playbackStatus.duration,
         playbackStatusProvider.playingItem,
       ),

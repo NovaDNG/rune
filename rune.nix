@@ -1,8 +1,7 @@
 {
   lib,
   stdenv,
-  flutter324,
-  protoc-gen-prost,
+  flutter,
   rustPlatform,
   alsa-lib,
   fetchFromGitHub,
@@ -12,13 +11,11 @@
   dbus,
   libnotify,
   libayatana-appindicator,
-  protobuf_26,
-  protoc-gen-dart,
   targetFlutterPlatform ? "linux",
 }:
 
 let
-  version = "1.1.0";
+  version = "2.0.1008";
 
   metaCommon = {
     description = "Experience timeless melodies with a music player that blends classic design with modern technology";
@@ -40,7 +37,7 @@ let
     system_tray = "sha256-1XMVu1uHy4ZgPKDqfQ7VTDVJvDxky5+/BbocGz8rKYs=";
   };
 
-  src = flutter324.buildFlutterApplication {
+  src = flutter.buildFlutterApplication {
     inherit version pubspecLock gitHashes;
     pname = "source";
 
@@ -52,15 +49,17 @@ let
     };
 
     nativeBuildInputs = [
-      protobuf_26
-      protoc-gen-prost
-      protoc-gen-dart
+      rustPlatform.cargoSetupHook
+      pkg-config
     ];
 
     buildPhase = ''
       runHook preBuild
 
-      packageRun rinf message
+      export CARGO_HOME=$(mktemp -d)
+      cargo install rinf_cli
+      export PATH="$CARGO_HOME/bin:$PATH"
+      rinf gen
 
       runHook postBuild
     '';
@@ -87,7 +86,6 @@ let
 
     nativeBuildInputs = [
       pkg-config
-      protobuf_26
     ];
 
     buildInputs = [
@@ -105,7 +103,7 @@ let
     };
   };
 in
-flutter324.buildFlutterApplication {
+flutter.buildFlutterApplication {
   inherit
     version
     src
@@ -113,6 +111,11 @@ flutter324.buildFlutterApplication {
     gitHashes
     ;
   pname = "rune-${targetFlutterPlatform}";
+
+  nativeBuildInputs = [
+    rustPlatform.cargoSetupHook
+    pkg-config
+  ];
 
   buildInputs = [
     libnotify

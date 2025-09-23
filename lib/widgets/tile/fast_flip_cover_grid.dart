@@ -49,12 +49,24 @@ class FastFlipCoverGridState extends State<FastFlipCoverGrid>
   final Map<String, ui.Image> _imageCache = {};
   final ImageProxy _imageProxy = imageMemoryManager.requireProxy();
   Ticker? _ticker;
+  Timer? _checkTimer;
   bool _isExecuting = false;
 
   @override
   void initState() {
     super.initState();
     _initializeGrid();
+    if (widget.paths.length > 1) {
+      _checkTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+        if (!mounted) {
+          timer.cancel();
+          return;
+        }
+        if (!_isExecuting) {
+          _check();
+        }
+      });
+    }
   }
 
   int i = 0;
@@ -77,21 +89,17 @@ class FastFlipCoverGridState extends State<FastFlipCoverGrid>
     final int size = (widget.size / _gridCount).ceil();
     final targetSize = size * pixelRatio.ceil();
 
-    _images = List.generate(
-      _gridCount * _gridCount,
-      (i) => _imageProxy.getCachedImage(_frontPaths[i], targetSize),
-    );
-
-    _colors = List.from(_frontColors);
+    for (int k = 0; k < _gridCount * _gridCount; k++) {
+      _images[k] = _imageProxy.getCachedImage(_backPaths[k], targetSize);
+    }
 
     if (_ticker == null) {
+      _ticker = Ticker(_onTick);
       if (widget.paths.length > 1) {
         _updateCache();
-        _ticker = Ticker(_onTick)..start();
       } else {
         _updateCache().then((_) {
           if (!mounted) return;
-          _images[0] = _imageCache[widget.paths[0]];
           setState(() {});
         });
       }
@@ -102,6 +110,7 @@ class FastFlipCoverGridState extends State<FastFlipCoverGrid>
   void dispose() {
     super.dispose();
     _ticker?.dispose();
+    _checkTimer?.cancel();
     _imageCache.clear();
     _imageProxy.dispose();
   }
@@ -136,6 +145,8 @@ class FastFlipCoverGridState extends State<FastFlipCoverGrid>
     _isFlipping = List.filled(_gridCount * _gridCount, false);
     _flipStartTimes = List.filled(_gridCount * _gridCount, null);
     _rotates = List.filled(_gridCount * _gridCount, 0.0);
+    _images = List.filled(_gridCount * _gridCount, null);
+    _colors = List.from(_backColors);
   }
 
   int _determineGridSize() {
@@ -145,10 +156,6 @@ class FastFlipCoverGridState extends State<FastFlipCoverGrid>
   }
 
   void _onTick(Duration elapsed) {
-    if (!_isExecuting) {
-      _check();
-    }
-
     _updateParameters();
   }
 
@@ -186,10 +193,18 @@ class FastFlipCoverGridState extends State<FastFlipCoverGrid>
 
     final resizedImage = await _imageProxy.requestImage(path, targetSize);
 
-    // Store the image in cache
     _imageCache[path] = resizedImage;
 
     if (!mounted) return;
+
+    for (int k = 0; k < _gridCount * _gridCount; k++) {
+      final currentPath =
+          (_rotates[k] >= pi / 2) ? _frontPaths[k] : _backPaths[k];
+      if (currentPath == path) {
+        _images[k] = resizedImage;
+      }
+    }
+
     setState(() {});
   }
 
@@ -213,15 +228,20 @@ class FastFlipCoverGridState extends State<FastFlipCoverGrid>
   }
 
   void _prepareFlip() {
+    bool isGoingToFlip = false;
     for (int k = 0; k < _gridCount * _gridCount; k++) {
       if (rand(k.toDouble()) > 0.64) {
         _isFlipping[k] = true;
         _flipStartTimes[k] = DateTime.now();
         _stageFlipGridData(k);
+        isGoingToFlip = true;
       } else {
         _isFlipping[k] = false;
         _flipStartTimes[k] = null;
       }
+    }
+    if (isGoingToFlip && !(_ticker?.isActive ?? false)) {
+      _ticker?.start();
     }
   }
 
@@ -264,6 +284,10 @@ class FastFlipCoverGridState extends State<FastFlipCoverGrid>
     if (needsUpdate) {
       if (!mounted) return;
       setState(() {});
+    } else {
+      if (_ticker?.isActive ?? false) {
+        _ticker?.stop();
+      }
     }
   }
 

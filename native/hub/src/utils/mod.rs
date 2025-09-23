@@ -2,27 +2,30 @@ pub mod broadcastable;
 pub mod nid;
 pub mod player;
 
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::{Context, Result};
-use dunce::canonicalize;
+use fsio::FsIo;
 use log::{error, info};
 use nid::get_or_create_node_id;
+use rinf::DartSignal;
 use scrobbling::manager::ScrobblingServiceManager;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use ::database::{
     actions::{
-        collection::CollectionQueryType, cover_art::bake_cover_art_by_media_files,
-        metadata::MetadataSummary, mixes::query_mix_media_files,
+        cover_art::bake_cover_art_by_media_files, metadata::MetadataSummary,
+        mixes::query_mix_media_files,
     },
     connection::{
-        check_library_state, connect_main_db, connect_recommendation_db, create_redirect,
-        LibraryState, MainDbConnection, RecommendationDbConnection,
+        LibraryState, MainDbConnection, RecommendationDbConnection, check_library_state,
+        connect_main_db, connect_recommendation_db, create_redirect,
     },
     entities::media_files,
     playing_item::MediaFileHandle,
@@ -40,9 +43,10 @@ use crate::server::ServerManager;
 
 #[cfg(target_os = "android")]
 use tracing_logcat::{LogcatMakeWriter, LogcatTag};
+#[cfg(not(target_os = "android"))]
+use tracing_subscriber::EnvFilter;
 #[cfg(target_os = "android")]
 use tracing_subscriber::fmt::format::Format;
-use tracing_subscriber::EnvFilter;
 
 pub struct DatabaseConnections {
     pub main_db: Arc<MainDbConnection>,
@@ -50,17 +54,19 @@ pub struct DatabaseConnections {
 }
 
 pub async fn initialize_databases(
+    fsio: &FsIo,
     path: &str,
     db_path: Option<&str>,
     node_id: &str,
 ) -> Result<DatabaseConnections> {
     info!("Initializing databases");
 
-    let main_db = connect_main_db(path, db_path, node_id)
+    let main_db = connect_main_db(fsio, path, db_path, node_id)
         .await
         .with_context(|| "Failed to connect to main DB")?;
 
-    let recommend_db = connect_recommendation_db(path, db_path)
+    let recommend_db = connect_recommendation_db(fsio, path, db_path)
+        .await
         .with_context(|| "Failed to connect to recommendation DB")?;
 
     Ok(DatabaseConnections {
@@ -83,6 +89,7 @@ pub enum RunningMode {
 }
 
 pub struct GlobalParams {
+    pub fsio: Arc<FsIo>,
     pub lib_path: Arc<String>,
     pub config_path: Arc<String>,
     pub node_id: Arc<String>,
@@ -114,31 +121,14 @@ pub trait ParamsExtractor {
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params;
 }
 
-pub trait RinfRustSignal: ::prost::Message {
-    fn send(&self);
+pub trait RinfRustSignal {
     fn name(&self) -> String;
-    fn encode_message(&self) -> Vec<u8>;
-}
 
-#[macro_export]
-macro_rules! broadcastable {
-    ($($t:ty),*) => {
-        $(
-            impl RinfRustSignal for $t {
-                fn send(&self) {
-                    self.send_signal_to_dart()
-                }
+    /// Encodes the message into a byte vector.
+    fn encode_to_vec(&self) -> Result<Vec<u8>>;
 
-                fn name(&self) -> String {
-                    stringify!($t).to_string()
-                }
-
-                fn encode_message(&self) -> Vec<u8> {
-                    self.encode_to_vec()
-                }
-            }
-        )*
-    };
+    /// Sends the message to Dart.
+    fn send_to_dart(&self);
 }
 
 pub trait Broadcaster: Send + Sync {
@@ -149,7 +139,7 @@ pub struct LocalGuiBroadcaster;
 
 impl Broadcaster for LocalGuiBroadcaster {
     fn broadcast(&self, message: &dyn RinfRustSignal) {
-        message.send();
+        message.send_to_dart();
     }
 }
 
@@ -157,26 +147,40 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
     let receiver = SetMediaLibraryPathRequest::get_dart_signal_receiver();
     let broadcaster: Arc<dyn Broadcaster> = Arc::new(LocalGuiBroadcaster);
 
+    info!("Receive media library path loop started");
+
     loop {
         while let Some(dart_signal) = receiver.recv().await {
+            info!("Received media library path message");
             let media_library_path = &dart_signal.message.path;
+
+            info!("Received media library {media_library_path}");
+
             let config_path = &dart_signal.message.config_path;
             let alias = &dart_signal.message.alias;
-            let node_id = get_or_create_node_id(config_path).await?.to_string();
+            #[cfg(not(target_os = "android"))]
+            let fsio = Arc::new(FsIo::new());
+            #[cfg(target_os = "android")]
+            let fsio = Arc::new(FsIo::new(
+                Path::new(".rune/.android-fs.db"),
+                &dart_signal.message.path,
+            )?);
+            let node_id = get_or_create_node_id(&fsio, config_path).await?.to_string();
 
-            match &dart_signal.message.hosted_on() {
+            match &dart_signal.message.hosted_on {
                 OperationDestination::Local => {
                     let database_path = dart_signal.message.db_path;
                     let database_mode = dart_signal.message.mode;
-                    info!("Received path: {}", media_library_path);
+                    info!("Received path: {media_library_path}");
 
                     let library_test = match check_library_state(media_library_path) {
                         Ok(x) => x,
                         Err(e) => {
+                            error!("Failed to check library state: {e:#?}");
                             broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                                path: media_library_path.clone(),
+                                path: media_library_path.to_string(),
                                 success: false,
-                                error: Some(format!("{:#?}", e)),
+                                error: Some(format!("{e:#?}")),
                                 not_ready: false,
                             });
                             continue;
@@ -187,8 +191,8 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
                         match &library_test {
                             LibraryState::Uninitialized => {
                                 broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                                    path: media_library_path.clone(),
-                                    success: false,
+                                    path: media_library_path.to_string(),
+                                    success: true,
                                     error: None,
                                     not_ready: true,
                                 });
@@ -198,28 +202,32 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
                         }
                     }
 
-                    if let Some(mode) = database_mode {
-                        if mode == 1 {
-                            if let Err(e) = create_redirect(media_library_path) {
-                                broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                                    path: media_library_path.clone(),
-                                    success: false,
-                                    error: Some(format!("{:#?}", e)),
-                                    not_ready: false,
-                                });
-                                continue;
-                            }
-                        }
+                    if let Some(mode) = database_mode
+                        && mode == LibraryInitializeMode::Redirected
+                        && let Err(e) = create_redirect(media_library_path)
+                    {
+                        broadcaster.broadcast(&SetMediaLibraryPathResponse {
+                            path: media_library_path.to_string(),
+                            success: false,
+                            error: Some(format!("{e:#?}")),
+                            not_ready: false,
+                        });
+                        continue;
                     }
 
                     // Initialize databases
-                    match initialize_databases(media_library_path, Some(&database_path), &node_id)
-                        .await
+                    match initialize_databases(
+                        &fsio,
+                        media_library_path,
+                        Some(&database_path),
+                        &node_id,
+                    )
+                    .await
                     {
                         Ok(db_connections) => {
                             // Send success response to Dart
                             broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                                path: media_library_path.clone(),
+                                path: media_library_path.to_string(),
                                 success: true,
                                 error: None,
                                 not_ready: false,
@@ -230,6 +238,7 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
 
                             // Continue with main loop
                             local_player_loop(
+                                fsio,
                                 media_library_path.to_string(),
                                 config_path.to_string(),
                                 db_connections,
@@ -239,12 +248,12 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
                             .await;
                         }
                         Err(e) => {
-                            error!("Database initialization failed: {:#?}", e);
+                            error!("Database initialization failed: {e:#?}");
                             // Send error response to Dart
                             broadcaster.broadcast(&SetMediaLibraryPathResponse {
                                 path: media_library_path.to_string(),
                                 success: false,
-                                error: Some(format!("{:#?}", e)),
+                                error: Some(format!("{e:#?}")),
                                 not_ready: false,
                             });
                         }
@@ -252,20 +261,21 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
                 }
                 OperationDestination::Remote => {
                     let config_path = &dart_signal.message.config_path;
-                    match server_player_loop(media_library_path, config_path, alias).await {
+                    match server_player_loop(fsio, media_library_path, config_path, alias).await {
                         Ok(_) => {
                             broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                                path: media_library_path.clone(),
+                                path: media_library_path.to_string(),
                                 success: true,
                                 error: None,
                                 not_ready: false,
                             });
                         }
                         Err(e) => {
+                            error!("Failed to server player loop: {e:#?}");
                             broadcaster.broadcast(&SetMediaLibraryPathResponse {
-                                path: media_library_path.clone(),
+                                path: media_library_path.to_string(),
                                 success: false,
-                                error: Some(format!("{:#?}", e)),
+                                error: Some(format!("{e:#?}")),
                                 not_ready: false,
                             });
                         }
@@ -279,6 +289,7 @@ pub async fn receive_media_library_path(scrobbler: Arc<Mutex<ScrobblingManager>>
 }
 
 pub async fn inject_cover_art_map(
+    fsio: &FsIo,
     main_db: &MainDbConnection,
     recommend_db: Arc<RecommendationDbConnection>,
     collection: Collection,
@@ -289,7 +300,7 @@ pub async fn inject_cover_art_map(
     let files = query_cover_arts(
         main_db,
         recommend_db,
-        if collection.collection_type == i32::from(CollectionQueryType::Track) {
+        if collection.collection_type == CollectionType::Track {
             if collection.queries.is_empty() {
                 vec![]
             } else {
@@ -303,7 +314,7 @@ pub async fn inject_cover_art_map(
     .await?;
 
     // Get the base cover art paths
-    let raw_cover_art_map = bake_cover_art_by_media_files(main_db, files).await?;
+    let raw_cover_art_map = bake_cover_art_by_media_files(fsio, main_db, files).await?;
 
     // Process the cover art paths based on the running mode
     let cover_art_map: HashMap<i32, String> = raw_cover_art_map
@@ -379,7 +390,7 @@ pub fn process_cover_art_path(
                         .unwrap_or_default();
 
                     // Construct the URL using the host and cache prefix
-                    format!("{}/files/cache/{}", host, file_name)
+                    format!("{host}/files/cache/{file_name}")
                 } else {
                     // No host available, return the original path
                     path.to_string()
@@ -394,14 +405,15 @@ pub fn process_cover_art_path(
 }
 
 pub async fn parse_media_files(
+    fsio: &FsIo,
     media_summaries: Vec<MetadataSummary>,
     lib_path: Arc<String>,
 ) -> Result<Vec<MediaFile>> {
     let mut media_files = Vec::with_capacity(media_summaries.len());
 
     for file in media_summaries {
-        let media_path = canonicalize(
-            Path::new(lib_path.as_ref())
+        let media_path = fsio.canonicalize_path(
+            &Path::new(lib_path.as_ref())
                 .join(&file.directory)
                 .join(&file.file_name),
         );
@@ -437,7 +449,7 @@ pub async fn parse_media_files(
                 media_files.push(media_file);
             }
             Err(e) => {
-                error!("{:?}", e);
+                error!("{e:?}");
             }
         }
     }
@@ -445,25 +457,35 @@ pub async fn parse_media_files(
     Ok(media_files)
 }
 
-pub fn files_to_playback_request(
-    lib_path: &String,
+pub fn files_to_playback_request<P: AsRef<Path>>(
+    fsio: &FsIo,
+    lib_path: &P,
     files: &[MediaFileHandle],
 ) -> Vec<(PlayingItem, PathBuf)> {
     files
         .iter()
         .filter_map(|file| {
-            let file_path = match &file.item {
-                PlayingItem::InLibrary(_) => Path::new(lib_path)
-                    .join(&file.directory)
-                    .join(&file.file_name),
-                PlayingItem::IndependentFile(path_buf) => path_buf.to_path_buf(),
-                PlayingItem::Unknown => Path::new("/").to_path_buf(),
+            let path_buf = match &file.item {
+                PlayingItem::InLibrary(_) => match fsio.canonicalize_path(
+                    &lib_path
+                        .as_ref()
+                        .join(&file.directory)
+                        .join(&file.file_name),
+                ) {
+                    Ok(x) => x,
+                    Err(_) => return None,
+                },
+                PlayingItem::IndependentFile(raw_path) => {
+                    match fsio.canonicalize_path_str(raw_path) {
+                        Ok(x) => x,
+                        Err(_) => return None,
+                    }
+                }
+                PlayingItem::Online(_, _) => PathBuf::new(),
+                PlayingItem::Unknown => return None,
             };
 
-            match canonicalize(&file_path) {
-                Ok(canonical_path) => Some((file.item.clone(), canonical_path)),
-                Err(_) => None,
-            }
+            Some((file.item.clone(), path_buf))
         })
         .collect()
 }

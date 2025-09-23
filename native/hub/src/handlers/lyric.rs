@@ -1,25 +1,27 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::Result;
 
 use ::database::{
     connection::MainDbConnection, playing_item::dispatcher::PlayingItemActionDispatcher,
 };
+use ::fsio::FsIo;
 use ::lyric::{lrc::parse_lrc, parser::parse_audio_lyrics};
 use ::metadata::reader::get_lyrics;
 use ::playback::player::PlayingItem;
 
 use crate::{
+    Session, Signal,
     messages::*,
     utils::{GlobalParams, ParamsExtractor},
-    Session, Signal,
 };
 
 impl ParamsExtractor for GetLyricByTrackIdRequest {
-    type Params = (Arc<String>, Arc<MainDbConnection>);
+    type Params = (Arc<FsIo>, Arc<String>, Arc<MainDbConnection>);
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
+            Arc::clone(&all_params.fsio),
             Arc::clone(&all_params.lib_path),
             Arc::clone(&all_params.main_db),
         )
@@ -27,12 +29,12 @@ impl ParamsExtractor for GetLyricByTrackIdRequest {
 }
 
 impl Signal for GetLyricByTrackIdRequest {
-    type Params = (Arc<String>, Arc<MainDbConnection>);
+    type Params = (Arc<FsIo>, Arc<String>, Arc<MainDbConnection>);
     type Response = GetLyricByTrackIdResponse;
 
     async fn handle(
         &self,
-        (lib_path, main_db): Self::Params,
+        (fsio, lib_path, main_db): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -44,7 +46,8 @@ impl Signal for GetLyricByTrackIdRequest {
 
             let path = dispatcher
                 .get_file_path(
-                    Path::new(lib_path.as_ref()),
+                    &fsio,
+                    lib_path.as_ref(),
                     &main_db,
                     [parsed_item.clone()].as_ref(),
                 )
@@ -64,7 +67,7 @@ impl Signal for GetLyricByTrackIdRequest {
                     match lyrics {
                         Some(lyric) => match lyric {
                             Ok(lyric) => Ok(Some(GetLyricByTrackIdResponse {
-                                item: Some(item.clone()),
+                                item: item.clone(),
                                 lines: lyric
                                     .lyrics
                                     .into_iter()
@@ -84,17 +87,17 @@ impl Signal for GetLyricByTrackIdRequest {
                                     .collect(),
                             })),
                             Err(err) => {
-                                Err(err.context(format!("Unable to parse lyric: item={:#?}", item)))
+                                Err(err.context(format!("Unable to parse lyric: item={item:#?}")))
                             }
                         },
                         None => Ok(Some(GetLyricByTrackIdResponse {
-                            item: Some(item.clone()),
+                            item: item.clone(),
                             lines: [].to_vec(),
                         })),
                     }
                 }
                 None => Ok(Some(GetLyricByTrackIdResponse {
-                    item: Some(item.clone()),
+                    item: item.clone(),
                     lines: [].to_vec(),
                 })),
             }

@@ -1,8 +1,8 @@
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, hash_map};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use log::{debug, warn};
 use sea_orm::{
@@ -21,7 +21,7 @@ use ::sync::{
 
 use crate::entities::{
     albums, artists, genres, media_cover_art, media_file_albums, media_file_artists,
-    media_file_genres, media_files,
+    media_file_fingerprint, media_file_genres, media_file_similarity, media_files,
 };
 
 /// Foreign key resolver implementation for the Rune.
@@ -228,8 +228,12 @@ where
             {
                 e.insert(sync_id_str);
             } else {
-                warn!("Could not find sync_id for parent {} referenced by local_id {} (child record {}). Parent might not exist or missing HLC UUID.",
-                    std::any::type_name::<ParentEntity>(), parent_local_id.to_string(), r_model.unique_id());
+                warn!(
+                    "Could not find sync_id for parent {} referenced by local_id {} (child record {}). Parent might not exist or missing HLC UUID.",
+                    std::any::type_name::<ParentEntity>(),
+                    parent_local_id.to_string(),
+                    r_model.unique_id()
+                );
             }
         }
     }
@@ -274,11 +278,7 @@ fn extract_sync_id_from_chunk_map(
             .is_some_and(|m| m.get(parent_id_str).is_none())
     {
         warn!(
-            "Sync ID not found in map for {}.{} = {} (remote model {}). Child of non-existent parent?",
-            table_name_for_log,
-            fk_col_name,
-            parent_id_str,
-            model_unique_id
+            "Sync ID not found in map for {table_name_for_log}.{fk_col_name} = {parent_id_str} (remote model {model_unique_id}). Child of non-existent parent?"
         );
     }
     sync_id
@@ -461,35 +461,25 @@ macro_rules! impl_junction_table_fk_ops {
     (
         $model:ty,
         $active_model:ty,
-        $table_name:expr, // This is the table name string
+        $table_name:expr,
         [
-            ($fk1_field:ident, $fk1_col:expr, $parent1_entity:ty, $parent1_col:expr),
-            ($fk2_field:ident, $fk2_col:expr, $parent2_entity:ty, $parent2_col:expr)
+            $(($fk_field:ident, $fk_col:expr, $parent_entity:ty, $parent_col:expr)),*
         ]
     ) => {
         #[async_trait]
         impl ModelWithForeignKeyOps for $model {
             async fn extract_model_fk_sync_ids<E: DatabaseExecutor>(&self, db: &E) -> Result<FkPayload> {
                 let mut payload = FkPayload::new();
-
-                let fk1_col_name = $fk1_col.to_string();
-                let fk1_sync_id = get_referenced_sync_id::<$parent1_entity, _>(
-                    db,
-                    Some(self.$fk1_field),
-                    $parent1_col,
-                )
-                .await?;
-                payload.insert(fk1_col_name, fk1_sync_id);
-
-                let fk2_col_name = $fk2_col.to_string();
-                let fk2_sync_id = get_referenced_sync_id::<$parent2_entity, _>(
-                    db,
-                    Some(self.$fk2_field),
-                    $parent2_col,
-                )
-                .await?;
-                payload.insert(fk2_col_name, fk2_sync_id);
-
+                $(
+                    let fk_col_name = $fk_col.to_string();
+                    let fk_sync_id = get_referenced_sync_id::<$parent_entity, _>(
+                        db,
+                        Some(self.$fk_field),
+                        $parent_col,
+                    )
+                    .await?;
+                    payload.insert(fk_col_name, fk_sync_id);
+                )*
                 Ok(payload)
             }
 
@@ -498,31 +488,19 @@ macro_rules! impl_junction_table_fk_ops {
                 db: &DbEx,
             ) -> Result<ChunkFkMapping> {
                 let mut overall_mapping = ChunkFkMapping::new();
-
-                let fk1_col_str = $fk1_col.to_string();
-                if let Some(map) = generate_fk_mapping_for_column::<$parent1_entity, _, _, _>(
-                    records,
-                    |r| r.$fk1_field,
-                    $parent1_col,
-                    db,
-                )
-                .await?
-                {
-                    overall_mapping.insert(fk1_col_str, map);
-                }
-
-                let fk2_col_str = $fk2_col.to_string();
-                if let Some(map) = generate_fk_mapping_for_column::<$parent2_entity, _, _, _>(
-                    records,
-                    |r| r.$fk2_field,
-                    $parent2_col,
-                    db,
-                )
-                .await?
-                {
-                    overall_mapping.insert(fk2_col_str, map);
-                }
-
+                $(
+                    let fk_col_str = $fk_col.to_string();
+                    if let Some(map) = generate_fk_mapping_for_column::<$parent_entity, _, _, _>(
+                        records,
+                        |r| r.$fk_field,
+                        $parent_col,
+                        db,
+                    )
+                    .await?
+                    {
+                        overall_mapping.insert(fk_col_str, map);
+                    }
+                )*
                 Ok(overall_mapping)
             }
 
@@ -532,29 +510,18 @@ macro_rules! impl_junction_table_fk_ops {
             ) -> Result<FkPayload> {
                 let mut payload = FkPayload::new();
                 let model_unique_id = self.unique_id();
-
-                let fk1_col_name = $fk1_col.to_string();
-                let fk1_parent_id_str = self.$fk1_field.to_string();
-                let fk1_sync_id = extract_sync_id_from_chunk_map(
-                    chunk_fk_map,
-                    $table_name,
-                    &fk1_col_name,
-                    &fk1_parent_id_str,
-                    &model_unique_id,
-                );
-                payload.insert(fk1_col_name, fk1_sync_id);
-
-                let fk2_col_name = $fk2_col.to_string();
-                let fk2_parent_id_str = self.$fk2_field.to_string();
-                let fk2_sync_id = extract_sync_id_from_chunk_map(
-                    chunk_fk_map,
-                    $table_name,
-                    &fk2_col_name,
-                    &fk2_parent_id_str,
-                    &model_unique_id,
-                );
-                payload.insert(fk2_col_name, fk2_sync_id);
-
+                $(
+                    let fk_col_name = $fk_col.to_string();
+                    let fk_parent_id_str = self.$fk_field.to_string();
+                    let fk_sync_id = extract_sync_id_from_chunk_map(
+                        chunk_fk_map,
+                        $table_name,
+                        &fk_col_name,
+                        &fk_parent_id_str,
+                        &model_unique_id,
+                    );
+                    payload.insert(fk_col_name, fk_sync_id);
+                )*
                 Ok(payload)
             }
         }
@@ -566,42 +533,25 @@ macro_rules! impl_junction_table_fk_ops {
                 fk_sync_id_payload: &FkPayload,
                 db: &E,
             ) -> Result<()> {
-                let fk1_col_name = $fk1_col.to_string();
-                if let Some(sync_id_opt) = fk_sync_id_payload.get(&fk1_col_name) {
-                    let local_pk = set_foreign_key_from_sync_id::<$parent1_entity, _>(
-                        sync_id_opt.as_ref(),
-                        db,
-                        &fk1_col_name,
-                        false,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Failed to find local PK for {} using sync_id. Referenced entity may not exist locally.",
-                            fk1_col_name
+                $(
+                    let fk_col_name = $fk_col.to_string();
+                    if let Some(sync_id_opt) = fk_sync_id_payload.get(&fk_col_name) {
+                        let local_pk = set_foreign_key_from_sync_id::<$parent_entity, _>(
+                            sync_id_opt.as_ref(),
+                            db,
+                            &fk_col_name,
+                            false, // Assuming junction table FKs are not nullable
                         )
-                    })?;
-                    self.$fk1_field = ActiveValue::Set(local_pk);
-                }
-
-                let fk2_col_name = $fk2_col.to_string();
-                if let Some(sync_id_opt) = fk_sync_id_payload.get(&fk2_col_name) {
-                    let local_pk = set_foreign_key_from_sync_id::<$parent2_entity, _>(
-                        sync_id_opt.as_ref(),
-                        db,
-                        &fk2_col_name,
-                        false,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Failed to find local PK for {} using sync_id. Referenced entity may not exist locally.",
-                            fk2_col_name
-                        )
-                    })?;
-                    self.$fk2_field = ActiveValue::Set(local_pk);
-                }
-
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Failed to find local PK for {} using sync_id. Referenced entity may not exist locally.",
+                                fk_col_name
+                            )
+                        })?;
+                        self.$fk_field = ActiveValue::Set(local_pk);
+                    }
+                )*
                 Ok(())
             }
         }
@@ -669,6 +619,38 @@ impl_junction_table_fk_ops!(
     ]
 );
 
+impl_junction_table_fk_ops!(
+    media_file_fingerprint::Model,
+    media_file_fingerprint::ActiveModel,
+    "media_file_fingerprints",
+    [(
+        media_file_id,
+        media_file_fingerprint::Column::MediaFileId,
+        media_files::Entity,
+        media_files::Column::Id
+    )]
+);
+
+impl_junction_table_fk_ops!(
+    media_file_similarity::Model,
+    media_file_similarity::ActiveModel,
+    "media_file_similarity",
+    [
+        (
+            file_id1,
+            media_file_similarity::Column::FileId1,
+            media_files::Entity,
+            media_files::Column::Id
+        ),
+        (
+            file_id2,
+            media_file_similarity::Column::FileId2,
+            media_files::Entity,
+            media_files::Column::Id
+        )
+    ]
+);
+
 #[async_trait]
 impl ModelWithForeignKeyOps for media_files::Model {
     async fn extract_model_fk_sync_ids<E: DatabaseExecutor>(&self, db: &E) -> Result<FkPayload> {
@@ -695,11 +677,11 @@ impl ModelWithForeignKeyOps for media_files::Model {
         let mut column_specific_map = HashMap::new();
 
         for record_model in records {
-            if let Some(parent_local_id) = record_model.cover_art_id {
-                if let hash_map::Entry::Vacant(e) =
+            if let Some(parent_local_id) = record_model.cover_art_id
+                && let hash_map::Entry::Vacant(e) =
                     column_specific_map.entry(parent_local_id.to_string())
-                {
-                    let parent_sync_id = get_referenced_sync_id::<media_cover_art::Entity, _>(
+            {
+                let parent_sync_id = get_referenced_sync_id::<media_cover_art::Entity, _>(
                         db,
                         Some(parent_local_id),
                         media_cover_art::Column::Id,
@@ -707,19 +689,19 @@ impl ModelWithForeignKeyOps for media_files::Model {
                     .await
                     .with_context(|| {
                         format!(
-                            "Failed to get sync_id for parent entity media_cover_art referenced by {} (local_id: {}) in child media_files",
-                            fk_column_name, parent_local_id
+                            "Failed to get sync_id for parent entity media_cover_art referenced by {fk_column_name} (local_id: {parent_local_id}) in child media_files"
                         )
                     })?;
 
-                    if let Some(sync_id_str) = parent_sync_id {
-                        e.insert(sync_id_str);
-                    } else {
-                        warn!(
-                                "Could not find sync_id for parent media_cover_art referenced by media_files.{} = {} (child record {}). Parent might not exist or missing HLC UUID.",
-                                fk_column_name, parent_local_id, record_model.unique_id()
-                            );
-                    }
+                if let Some(sync_id_str) = parent_sync_id {
+                    e.insert(sync_id_str);
+                } else {
+                    warn!(
+                        "Could not find sync_id for parent media_cover_art referenced by media_files.{} = {} (child record {}). Parent might not exist or missing HLC UUID.",
+                        fk_column_name,
+                        parent_local_id,
+                        record_model.unique_id()
+                    );
                 }
             }
         }
@@ -761,7 +743,9 @@ impl ModelWithForeignKeyOps for media_files::Model {
             {
                 warn!(
                     "FK column map for '{}' not found in ChunkFkMapping for entity '{}' (remote model {}). Foreign key will be unresolved.",
-                    fk_col_name, TABLE_NAME, self.unique_id()
+                    fk_col_name,
+                    TABLE_NAME,
+                    self.unique_id()
                 );
             }
         } else {
@@ -793,8 +777,7 @@ impl ActiveModelWithForeignKeyOps for media_files::ActiveModel {
 
             if local_cover_art_pk.is_none() && cover_art_sync_id_opt_str.is_some() {
                 debug!(
-                    "CoverArt with sync_id {:?} not found locally for media_files.cover_art_id. Setting FK to NULL.",
-                    cover_art_sync_id_opt_str
+                    "CoverArt with sync_id {cover_art_sync_id_opt_str:?} not found locally for media_files.cover_art_id. Setting FK to NULL."
                 );
             }
         }

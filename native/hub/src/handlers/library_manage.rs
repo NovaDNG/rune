@@ -1,28 +1,29 @@
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use tokio::{sync::Mutex, task};
 use tokio_util::sync::CancellationToken;
 
-use database::{
+use ::analysis::utils::computing_device::ComputingDevice;
+use ::database::{
     actions::{
         analysis::analysis_audio_library,
         cover_art::scan_cover_arts,
         fingerprint::{
-            compare_all_pairs, compute_file_fingerprints, mark_duplicate_files, Configuration,
+            Configuration, compare_all_pairs, compute_file_fingerprints, mark_duplicate_files,
         },
         metadata::scan_audio_library,
         recommendation::sync_recommendation,
     },
     connection::{MainDbConnection, RecommendationDbConnection},
 };
+use ::fsio::FsIo;
 
 use crate::{
-    messages::*,
-    utils::{determine_batch_size, Broadcaster, GlobalParams, ParamsExtractor},
     Session, Signal, TaskTokens,
+    messages::*,
+    utils::{Broadcaster, GlobalParams, ParamsExtractor, determine_batch_size},
 };
 
 impl ParamsExtractor for CloseLibraryRequest {
@@ -77,6 +78,7 @@ impl Signal for CloseLibraryRequest {
 
 impl ParamsExtractor for ScanAudioLibraryRequest {
     type Params = (
+        Arc<FsIo>,
         Arc<MainDbConnection>,
         Arc<String>,
         Arc<Mutex<TaskTokens>>,
@@ -85,6 +87,7 @@ impl ParamsExtractor for ScanAudioLibraryRequest {
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
+            Arc::clone(&all_params.fsio),
             Arc::clone(&all_params.main_db),
             Arc::clone(&all_params.node_id),
             Arc::clone(&all_params.task_tokens),
@@ -95,6 +98,7 @@ impl ParamsExtractor for ScanAudioLibraryRequest {
 
 impl Signal for ScanAudioLibraryRequest {
     type Params = (
+        Arc<FsIo>,
         Arc<MainDbConnection>,
         Arc<String>,
         Arc<Mutex<TaskTokens>>,
@@ -104,7 +108,7 @@ impl Signal for ScanAudioLibraryRequest {
 
     async fn handle(
         &self,
-        (main_db, node_id, task_tokens, broadcaster): Self::Params,
+        (fsio, main_db, node_id, task_tokens, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<()>> {
@@ -119,23 +123,28 @@ impl Signal for ScanAudioLibraryRequest {
         tokens.scan_token = Some(new_token.clone());
         drop(tokens); // Release the lock
 
-        let request = dart_signal.clone();
+        // Clone all the data we need before spawning the task
+        let request_path = dart_signal.path.clone();
+        let request_force = dart_signal.force;
         let main_db_clone = Arc::clone(&main_db);
+        let node_id_clone = Arc::clone(&node_id);
+        let broadcaster_clone = Arc::clone(&broadcaster);
 
         task::spawn_blocking(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             runtime.block_on(async move {
-                let path = request.path.clone();
                 let result: Result<()> = async {
                     let file_processed = scan_audio_library(
+                        &fsio,
                         &main_db_clone,
-                        Path::new(&path.clone()),
+                        &node_id,
+                        Path::new(&request_path),
                         true,
-                        request.force,
+                        request_force,
                         |progress| {
-                            broadcaster.broadcast(&ScanAudioLibraryProgress {
-                                task: 0,
-                                path: path.clone(),
+                            broadcaster_clone.broadcast(&ScanAudioLibraryProgress {
+                                task: ScanTaskType::IndexFiles,
+                                path: request_path.clone(),
                                 progress: progress.try_into().unwrap(),
                                 total: 0,
                             });
@@ -147,8 +156,8 @@ impl Signal for ScanAudioLibraryRequest {
                     if new_token.is_cancelled() {
                         info!("Operation cancelled during artist processing.");
 
-                        broadcaster.broadcast(&ScanAudioLibraryResponse {
-                            path: request.path.clone(),
+                        broadcaster_clone.broadcast(&ScanAudioLibraryResponse {
+                            path: request_path.clone(),
                             progress: -1,
                         });
 
@@ -156,17 +165,19 @@ impl Signal for ScanAudioLibraryRequest {
                     }
 
                     let batch_size = determine_batch_size(0.75);
-                    let cloned_broadcaster = Arc::clone(&broadcaster);
+                    let cloned_broadcaster = Arc::clone(&broadcaster_clone);
+                    let path_for_closure = request_path.clone();
 
                     scan_cover_arts(
+                        fsio,
                         &main_db_clone,
-                        Path::new(&path.clone()),
-                        &node_id,
+                        Path::new(&request_path),
+                        &node_id_clone,
                         batch_size,
                         move |now, total| {
                             cloned_broadcaster.broadcast(&ScanAudioLibraryProgress {
-                                task: 1,
-                                path: path.clone(),
+                                task: ScanTaskType::ScanCoverArts,
+                                path: path_for_closure.clone(),
                                 progress: now.try_into().unwrap(),
                                 total: total.try_into().unwrap(),
                             });
@@ -175,8 +186,8 @@ impl Signal for ScanAudioLibraryRequest {
                     )
                     .await?;
 
-                    broadcaster.broadcast(&ScanAudioLibraryResponse {
-                        path: request.path.clone(),
+                    broadcaster_clone.broadcast(&ScanAudioLibraryResponse {
+                        path: request_path.clone(),
                         progress: file_processed as i32,
                     });
 
@@ -193,9 +204,20 @@ impl Signal for ScanAudioLibraryRequest {
     }
 }
 
+impl From<ComputingDeviceRequest> for ComputingDevice {
+    fn from(value: ComputingDeviceRequest) -> Self {
+        match value {
+            ComputingDeviceRequest::Cpu => ComputingDevice::Cpu,
+            ComputingDeviceRequest::Gpu => ComputingDevice::Gpu,
+        }
+    }
+}
+
 impl ParamsExtractor for AnalyzeAudioLibraryRequest {
     type Params = (
+        Arc<FsIo>,
         Arc<MainDbConnection>,
+        Arc<String>,
         Arc<RecommendationDbConnection>,
         Arc<Mutex<TaskTokens>>,
         Arc<dyn Broadcaster>,
@@ -203,7 +225,9 @@ impl ParamsExtractor for AnalyzeAudioLibraryRequest {
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
+            Arc::clone(&all_params.fsio),
             Arc::clone(&all_params.main_db),
+            Arc::clone(&all_params.node_id),
             Arc::clone(&all_params.recommend_db),
             Arc::clone(&all_params.task_tokens),
             Arc::clone(&all_params.broadcaster),
@@ -213,7 +237,9 @@ impl ParamsExtractor for AnalyzeAudioLibraryRequest {
 
 impl Signal for AnalyzeAudioLibraryRequest {
     type Params = (
+        Arc<FsIo>,
         Arc<MainDbConnection>,
+        Arc<String>,
         Arc<RecommendationDbConnection>,
         Arc<Mutex<TaskTokens>>,
         Arc<dyn Broadcaster>,
@@ -222,7 +248,7 @@ impl Signal for AnalyzeAudioLibraryRequest {
 
     async fn handle(
         &self,
-        (main_db, recommend_db, task_tokens, broadcaster): Self::Params,
+        (fsio, main_db, node_id, recommend_db, task_tokens, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -235,12 +261,14 @@ impl Signal for AnalyzeAudioLibraryRequest {
         tokens.analyze_token = Some(new_token.clone());
         drop(tokens);
 
-        let request = dart_signal.clone();
-        debug!("Analyzing media files: {:#?}", request);
+        // Clone the data from dart_signal before spawning the task
+        let request = dart_signal;
+        debug!("Analyzing media files: {request:#?}");
 
         let request_path = request.path.clone();
         let closure_request_path = request_path.clone();
         let batch_size = determine_batch_size(request.workload_factor);
+        let computing_device = request.computing_device;
 
         task::spawn_blocking(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -248,10 +276,12 @@ impl Signal for AnalyzeAudioLibraryRequest {
                 let cloned_broadcaster = Arc::clone(&broadcaster);
                 let result = async {
                     let total_files = analysis_audio_library(
+                        fsio,
                         &main_db,
                         Path::new(&request_path),
+                        &node_id,
                         batch_size,
-                        request.computing_device.into(),
+                        computing_device.into(),
                         move |progress, total| {
                             cloned_broadcaster.broadcast(&AnalyzeAudioLibraryProgress {
                                 path: closure_request_path.clone(),
@@ -278,7 +308,7 @@ impl Signal for AnalyzeAudioLibraryRequest {
                 .await;
 
                 if let Err(e) = result {
-                    eprintln!("Error: {:?}", e);
+                    eprintln!("Error: {e:?}");
                 }
             })
         });
@@ -289,14 +319,18 @@ impl Signal for AnalyzeAudioLibraryRequest {
 
 impl ParamsExtractor for DeduplicateAudioLibraryRequest {
     type Params = (
+        Arc<FsIo>,
         Arc<MainDbConnection>,
+        Arc<String>,
         Arc<Mutex<TaskTokens>>,
         Arc<dyn Broadcaster>,
     );
 
     fn extract_params(&self, all_params: &GlobalParams) -> Self::Params {
         (
+            Arc::clone(&all_params.fsio),
             Arc::clone(&all_params.main_db),
+            Arc::clone(&all_params.node_id),
             Arc::clone(&all_params.task_tokens),
             Arc::clone(&all_params.broadcaster),
         )
@@ -305,7 +339,9 @@ impl ParamsExtractor for DeduplicateAudioLibraryRequest {
 
 impl Signal for DeduplicateAudioLibraryRequest {
     type Params = (
+        Arc<FsIo>,
         Arc<MainDbConnection>,
+        Arc<String>,
         Arc<Mutex<TaskTokens>>,
         Arc<dyn Broadcaster>,
     );
@@ -313,7 +349,7 @@ impl Signal for DeduplicateAudioLibraryRequest {
 
     async fn handle(
         &self,
-        (main_db, task_tokens, broadcaster): Self::Params,
+        (fsio, main_db, node_id, task_tokens, broadcaster): Self::Params,
         _session: Option<Session>,
         dart_signal: &Self,
     ) -> Result<Option<Self::Response>> {
@@ -326,7 +362,7 @@ impl Signal for DeduplicateAudioLibraryRequest {
         tokens.deduplicate_token = Some(new_token.clone());
         drop(tokens);
 
-        let request = dart_signal.clone();
+        let request = dart_signal;
         let request_path = Arc::new(request.path.clone());
         let batch_size = determine_batch_size(request.workload_factor);
         let config = Configuration::default();
@@ -344,8 +380,10 @@ impl Signal for DeduplicateAudioLibraryRequest {
 
                 let request_path_clone = request_path_clone.to_string();
                 compute_file_fingerprints(
+                    fsio,
                     &main_db,
                     Path::new(&request_path_clone),
+                    &node_id,
                     batch_size,
                     move |cur, total| {
                         let progress = cur as f32 / total as f32 * 0.33;
@@ -368,6 +406,7 @@ impl Signal for DeduplicateAudioLibraryRequest {
 
                 compare_all_pairs(
                     &main_db,
+                    &node_id,
                     batch_size,
                     move |cur, total| {
                         let progress = 0.33 + cur as f32 / total as f32 * 0.33;
@@ -438,7 +477,7 @@ impl Signal for CancelTaskRequest {
         let mut tokens = task_tokens.lock().await;
 
         let success = match request.r#type {
-            0 => {
+            CancelTaskType::AnalyzeAudioLibrary => {
                 if let Some(token) = tokens.analyze_token.take() {
                     warn!("Cancelling analyze task");
                     token.cancel();
@@ -447,7 +486,7 @@ impl Signal for CancelTaskRequest {
                     false
                 }
             }
-            1 => {
+            CancelTaskType::ScanAudioLibrary => {
                 if let Some(token) = tokens.scan_token.take() {
                     warn!("Cancelling scan task");
                     token.cancel();

@@ -1,20 +1,15 @@
-use std::collections::VecDeque;
-use std::fmt;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::VecDeque, fmt, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use log::{error, info, warn};
 use simple_channel::{SimpleChannel, SimpleReceiver, SimpleSender};
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::{sync::Mutex, time::sleep};
 
-use crate::last_fm::LastFmClient;
-use crate::libre_fm::LibreFmClient;
-use crate::listen_brainz::ListenBrainzClient;
-use crate::{ScrobblingClient, ScrobblingTrack};
+use crate::{
+    ScrobblingClient, ScrobblingTrack, last_fm::LastFmClient, libre_fm::LibreFmClient,
+    listen_brainz::ListenBrainzClient,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScrobblingService {
@@ -30,7 +25,7 @@ impl fmt::Display for ScrobblingService {
             ScrobblingService::LibreFm => "LibreFm",
             ScrobblingService::ListenBrainz => "ListenBrainz",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -51,7 +46,7 @@ impl FromStr for ScrobblingService {
 impl From<String> for ScrobblingService {
     fn from(s: String) -> Self {
         ScrobblingService::from_str(&s)
-            .unwrap_or_else(|_| panic!("Invalid string for ScrobblingService: {}", s))
+            .unwrap_or_else(|_| panic!("Invalid string for ScrobblingService: {s}"))
     }
 }
 
@@ -282,7 +277,7 @@ impl ScrobblingServiceManager for ScrobblingManager {
         let mut attempts = 0;
 
         loop {
-            info!("Authenticating to {} ({})...", service, attempts);
+            info!("Authenticating to {service} ({attempts})...");
             let result = match service {
                 ScrobblingService::LastFm => {
                     let api_key = api_key
@@ -318,7 +313,7 @@ impl ScrobblingServiceManager for ScrobblingManager {
                     self.is_authenticating = false;
                     self.process_cache().await;
                     self.send_login_status().await;
-                    info!("Authenticated to {}", service);
+                    info!("Authenticated to {}", { service });
                     break;
                 }
                 Err(e) => {
@@ -332,7 +327,7 @@ impl ScrobblingServiceManager for ScrobblingManager {
                         }
                     }
 
-                    error!("Failed to authenticate to {}: {}", service, e);
+                    error!("Failed to authenticate to {service}: {e}");
 
                     if attempts >= self.max_retries || !enable_retry {
                         self.is_authenticating = false;
@@ -353,12 +348,12 @@ impl ScrobblingServiceManager for ScrobblingManager {
                 self.now_playing_cache.pop_front();
             }
 
-            info!("Caching now playing update for {}", service);
+            info!("Caching now playing update for {}", { service });
 
             return;
         }
 
-        info!("Updating now playing for {}", service);
+        info!("Updating now playing for {}", { service });
 
         let max_retries = self.max_retries;
         let retry_delay = self.retry_delay;
@@ -377,25 +372,25 @@ impl ScrobblingServiceManager for ScrobblingManager {
                 .map(|c| c as &mut dyn ScrobblingClient),
         };
 
-        if let Some(client) = client {
-            if client.session_key().is_some() {
-                let result = ScrobblingManager::retry_update_now_playing(
-                    client,
-                    &track,
-                    max_retries,
-                    retry_delay,
-                )
-                .await;
+        if let Some(client) = client
+            && client.session_key().is_some()
+        {
+            let result = ScrobblingManager::retry_update_now_playing(
+                client,
+                &track,
+                max_retries,
+                retry_delay,
+            )
+            .await;
 
-                if let Err(e) = result {
-                    error!("Failed to update now playing for {}: {}", service, e);
+            if let Err(e) = result {
+                error!("Failed to update now playing for {service}: {e}");
 
-                    self.error_sender.send(ScrobblingError {
-                        service: *service,
-                        action: ActionType::UpdateNowPlaying,
-                        error: e,
-                    });
-                }
+                self.error_sender.send(ScrobblingError {
+                    service: *service,
+                    action: ActionType::UpdateNowPlaying,
+                    error: e,
+                });
             }
         }
     }
@@ -446,40 +441,37 @@ impl ScrobblingServiceManager for ScrobblingManager {
         let error_sender = Arc::clone(&self.error_sender);
 
         tokio::spawn(async move {
-            if let Some(client) = lastfm {
-                if client.session_key.is_some() {
-                    if let Err(e) = client.update_now_playing(&track).await {
-                        error_sender.send(ScrobblingError {
-                            service: ScrobblingService::LastFm,
-                            action: ActionType::UpdateNowPlaying,
-                            error: e,
-                        });
-                    }
-                }
+            if let Some(client) = lastfm
+                && client.session_key.is_some()
+                && let Err(e) = client.update_now_playing(&track).await
+            {
+                error_sender.send(ScrobblingError {
+                    service: ScrobblingService::LastFm,
+                    action: ActionType::UpdateNowPlaying,
+                    error: e,
+                });
             }
 
-            if let Some(client) = librefm {
-                if client.session_key.is_some() {
-                    if let Err(e) = client.update_now_playing(&track).await {
-                        error_sender.send(ScrobblingError {
-                            service: ScrobblingService::LibreFm,
-                            action: ActionType::UpdateNowPlaying,
-                            error: e,
-                        });
-                    }
-                }
+            if let Some(client) = librefm
+                && client.session_key.is_some()
+                && let Err(e) = client.update_now_playing(&track).await
+            {
+                error_sender.send(ScrobblingError {
+                    service: ScrobblingService::LibreFm,
+                    action: ActionType::UpdateNowPlaying,
+                    error: e,
+                });
             }
 
-            if let Some(client) = listenbrainz {
-                if client.session_key.is_some() {
-                    if let Err(e) = client.update_now_playing(&track).await {
-                        error_sender.send(ScrobblingError {
-                            service: ScrobblingService::ListenBrainz,
-                            action: ActionType::UpdateNowPlaying,
-                            error: e,
-                        });
-                    }
-                }
+            if let Some(client) = listenbrainz
+                && client.session_key.is_some()
+                && let Err(e) = client.update_now_playing(&track).await
+            {
+                error_sender.send(ScrobblingError {
+                    service: ScrobblingService::ListenBrainz,
+                    action: ActionType::UpdateNowPlaying,
+                    error: e,
+                });
             }
         });
     }
@@ -491,7 +483,7 @@ impl ScrobblingServiceManager for ScrobblingManager {
                 self.scrobble_cache.pop_front();
             }
 
-            info!("Caching scrobble for {}", service);
+            info!("Caching scrobble for {}", { service });
 
             return;
         }
@@ -520,7 +512,7 @@ impl ScrobblingServiceManager for ScrobblingManager {
                         .await;
 
                 if let Err(e) = result {
-                    error!("Failed to scrobble to {}: {}", service, e);
+                    error!("Failed to scrobble to {service}: {e}");
 
                     self.error_sender.send(ScrobblingError {
                         service,
@@ -528,10 +520,10 @@ impl ScrobblingServiceManager for ScrobblingManager {
                         error: e,
                     });
                 } else {
-                    info!("Scrobbled to {}", service);
+                    info!("Scrobbled to {}", { service });
                 }
             } else {
-                warn!("Not authenticated to {}", service);
+                warn!("Not authenticated to {}", { service });
             }
         }
     }
@@ -555,65 +547,65 @@ impl ScrobblingServiceManager for ScrobblingManager {
 
         tokio::spawn(async move {
             // Handle Last.fm
-            if let Some(mut client) = lastfm {
-                if client.session_key.is_some() {
-                    let result = ScrobblingManager::retry_scrobble(
-                        &mut client,
-                        &track,
-                        max_retries,
-                        retry_delay,
-                    )
-                    .await;
+            if let Some(mut client) = lastfm
+                && client.session_key.is_some()
+            {
+                let result = ScrobblingManager::retry_scrobble(
+                    &mut client,
+                    &track,
+                    max_retries,
+                    retry_delay,
+                )
+                .await;
 
-                    if let Err(e) = result {
-                        error_sender.send(ScrobblingError {
-                            service: ScrobblingService::LastFm,
-                            action: ActionType::Scrobbling,
-                            error: e,
-                        });
-                    }
+                if let Err(e) = result {
+                    error_sender.send(ScrobblingError {
+                        service: ScrobblingService::LastFm,
+                        action: ActionType::Scrobbling,
+                        error: e,
+                    });
                 }
             }
 
             // Handle Libre.fm
-            if let Some(mut client) = librefm {
-                if client.session_key.is_some() {
-                    let result = ScrobblingManager::retry_scrobble(
-                        &mut client,
-                        &track,
-                        max_retries,
-                        retry_delay,
-                    )
-                    .await;
+            if let Some(mut client) = librefm
+                && client.session_key.is_some()
+            {
+                let result = ScrobblingManager::retry_scrobble(
+                    &mut client,
+                    &track,
+                    max_retries,
+                    retry_delay,
+                )
+                .await;
 
-                    if let Err(e) = result {
-                        error_sender.send(ScrobblingError {
-                            service: ScrobblingService::LibreFm,
-                            action: ActionType::Scrobbling,
-                            error: e,
-                        });
-                    }
+                if let Err(e) = result {
+                    error_sender.send(ScrobblingError {
+                        service: ScrobblingService::LibreFm,
+                        action: ActionType::Scrobbling,
+                        error: e,
+                    });
                 }
             }
 
             // Handle ListenBrainz
-            if let Some(mut client) = listenbrainz {
-                if client.session_key.is_some() {
-                    let result = ScrobblingManager::retry_scrobble(
-                        &mut client,
-                        &track,
-                        max_retries,
-                        retry_delay,
-                    )
-                    .await;
+            if let Some(mut client) = listenbrainz
+                && client.session_key.is_some()
+            {
+                let result = ScrobblingManager::retry_scrobble(
+                    &mut client,
+                    &track,
+                    max_retries,
+                    retry_delay,
+                )
+                .await;
 
-                    if let Err(e) = result {
-                        error_sender.send(ScrobblingError {
-                            service: ScrobblingService::ListenBrainz,
-                            action: ActionType::Scrobbling,
-                            error: e,
-                        });
-                    }
+                if let Err(e) = result {
+                    error_sender.send(ScrobblingError {
+                        service: ScrobblingService::ListenBrainz,
+                        action: ActionType::Scrobbling,
+                        error: e,
+                    });
                 }
             }
         });
@@ -635,7 +627,7 @@ impl ScrobblingServiceManager for ScrobblingManager {
             }
         }
 
-        info!("Logged out from {}", service);
+        info!("Logged out from {}", { service });
         self.send_login_status().await;
     }
 

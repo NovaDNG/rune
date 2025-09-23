@@ -6,7 +6,7 @@ use ::database::actions::analysis::{get_analyze_count, if_analyze_exists};
 use ::database::connection::MainDbConnection;
 
 use crate::utils::{GlobalParams, ParamsExtractor};
-use crate::{messages::*, Session, Signal};
+use crate::{Session, Signal, messages::*};
 
 impl ParamsExtractor for IfAnalyzeExistsRequest {
     type Params = (Arc<MainDbConnection>,);
@@ -29,7 +29,7 @@ impl Signal for IfAnalyzeExistsRequest {
 
         let exists = if_analyze_exists(&main_db, file_id)
             .await
-            .with_context(|| format!("Failed to test if analysis exists: {}", file_id))?;
+            .with_context(|| format!("Failed to test if analysis exists: {file_id}"))?;
         Ok(Some(IfAnalyzeExistsResponse { file_id, exists }))
     }
 }

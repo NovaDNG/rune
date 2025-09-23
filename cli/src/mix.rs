@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use log::error;
-use prettytable::{row, Table};
+use prettytable::{Table, row};
 use rust_decimal::prelude::ToPrimitive;
 
 use database::actions::metadata::get_metadata_summary_by_file_ids;
@@ -39,16 +39,16 @@ pub async fn mixes(
             // Trim leading and trailing whitespace
             let param = param.trim();
             // Find the position of the first '(' and the last ')'
-            if let Some(start) = param.find('(') {
-                if let Some(end) = param.rfind(')') {
-                    // Extract the operator and parameter
-                    let operator = &param[..start];
-                    let parameter = &param[start + 1..end];
-                    // Trim leading and trailing whitespace and handle escape issues
-                    let operator = operator.trim().replace("\\(", "(").replace("\\)", ")");
-                    let parameter = parameter.trim().replace("\\(", "(").replace("\\)", ")");
-                    return Some((operator.to_string(), parameter.to_string()));
-                }
+            if let Some(start) = param.find('(')
+                && let Some(end) = param.rfind(')')
+            {
+                // Extract the operator and parameter
+                let operator = &param[..start];
+                let parameter = &param[start + 1..end];
+                // Trim leading and trailing whitespace and handle escape issues
+                let operator = operator.trim().replace("\\(", "(").replace("\\)", ")");
+                let parameter = parameter.trim().replace("\\(", "(").replace("\\)", ")");
+                return Some((operator.to_string(), parameter.to_string()));
             }
             None
         })
@@ -58,7 +58,7 @@ pub async fn mixes(
         match query_mix_media_files(main_db, recommend_db, mix_parameters_vec, 0, num).await {
             Ok(recommendations) => recommendations,
             Err(e) => {
-                eprintln!("Failed to get recommendations: {}", e);
+                eprintln!("Failed to get recommendations: {e}");
                 return;
             }
         };
@@ -90,23 +90,23 @@ pub async fn save_mixes_as_m3u8(output: Option<&PathBuf>, files: &Vec<media_file
         eprintln!("Warning: Output file extension corrected to .m3u8");
     }
 
-    if let Some(parent) = corrected_path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!("Failed to create directories: {}", e);
-            return;
-        }
+    if let Some(parent) = corrected_path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("Failed to create directories: {e}");
+        return;
     }
 
     let mut file = match File::create(&corrected_path) {
         Ok(file) => file,
         Err(e) => {
-            eprintln!("Failed to create file: {}", e);
+            eprintln!("Failed to create file: {e}");
             return;
         }
     };
 
     if let Err(e) = file.write_all("#EXTM3U\n".as_bytes()) {
-        eprintln!("Failed to write to file: {}", e);
+        eprintln!("Failed to write to file: {e}");
         return;
     }
 
@@ -122,7 +122,7 @@ pub async fn save_mixes_as_m3u8(output: Option<&PathBuf>, files: &Vec<media_file
             };
 
         if let Err(e) = writeln!(file, "{}", relative_to_output.display()) {
-            eprintln!("Failed to write to file: {}", e);
+            eprintln!("Failed to write to file: {e}");
             return;
         }
     }
@@ -139,10 +139,10 @@ fn format_time(seconds: f64) -> String {
     let minutes = total_seconds / 60;
     let remaining_seconds = total_seconds % 60;
 
-    let minutes_str = format!("{:02}", minutes);
-    let seconds_str = format!("{:02}", remaining_seconds);
+    let minutes_str = format!("{minutes:02}");
+    let seconds_str = format!("{remaining_seconds:02}");
 
-    format!("{}:{}", minutes_str, seconds_str)
+    format!("{minutes_str}:{seconds_str}")
 }
 
 pub async fn display_mixes_in_table(main_db: &MainDbConnection, files: &[media_files::Model]) {
@@ -179,7 +179,7 @@ pub async fn display_mixes_in_table(main_db: &MainDbConnection, files: &[media_f
             table.printstd();
         }
         Err(e) => {
-            error!("Failed to retrieve metadata summary: {}", e);
+            error!("Failed to retrieve metadata summary: {e}");
         }
     }
 }

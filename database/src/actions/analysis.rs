@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use fsio::FsIo;
 use futures::future::join_all;
 use log::info;
 use paste::paste;
@@ -13,7 +15,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use seq_macro::seq;
 use tokio_util::sync::CancellationToken;
 
-use analysis::analysis::{analyze_audio, normalize_analysis_result, NormalizedAnalysisResult};
+use analysis::analysis::{NormalizedAnalysisResult, analyze_audio, normalize_analysis_result};
 use analysis::utils::computing_device::ComputingDevice;
 
 use crate::entities::{media_analysis, media_files};
@@ -35,9 +37,12 @@ pub fn empty_progress_callback(_processed: usize, _total: usize) {}
 ///
 /// # Returns
 /// * `Result<(), sea_orm::DbErr>` - A result indicating success or failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn analysis_audio_library<F>(
+    fsio: Arc<FsIo>,
     main_db: &DatabaseConnection,
     lib_path: &Path,
+    node_id: &str,
     batch_size: usize,
     computing_device: ComputingDevice,
     progress_callback: F,
@@ -48,10 +53,7 @@ where
 {
     let progress_callback = Arc::new(progress_callback);
 
-    info!(
-        "Starting audio library analysis with batch size: {}",
-        batch_size
-    );
+    info!("Starting audio library analysis with batch size: {batch_size}");
 
     let existed_ids: Vec<i32> = media_analysis::Entity::find()
         .select_only()
@@ -65,6 +67,7 @@ where
         media_files::Entity::find().filter(media_files::Column::Id.is_not_in(existed_ids));
 
     let lib_path = Arc::new(lib_path.to_path_buf());
+    let node_id = Arc::new(node_id.to_owned());
 
     parallel_media_files_processing!(
         main_db,
@@ -73,22 +76,27 @@ where
         cancel_token,
         cursor_query,
         lib_path,
-        move |file, lib_path, cancel_token| {
-            analysis_file(file, lib_path, computing_device, cancel_token)
+        fsio,
+        node_id,
+        move |fsio, file, lib_path, cancel_token| {
+            analysis_file(fsio, file, lib_path, computing_device, cancel_token)
         },
         |db,
          file: media_files::Model,
+         node_id: Arc<String>,
          analysis_result: Result<Option<NormalizedAnalysisResult>>| async move {
             match analysis_result {
                 Ok(analysis_result) => {
                     if let Some(x) = analysis_result {
-                        match insert_analysis_result(db, file.id, x).await {
+                        match insert_analysis_result(db, &node_id, file.id, &file.file_hash, x)
+                            .await
+                        {
                             Ok(_) => debug!("Finished analysis: {}", file.id),
-                            Err(e) => error!("Failed to insert analysis result: {}", e),
+                            Err(e) => error!("Failed to insert analysis result: {e}"),
                         }
                     };
                 }
-                Err(e) => error!("Failed to analyze track: {}", e),
+                Err(e) => error!("Failed to analyze track: {e}"),
             }
         }
     )
@@ -103,6 +111,7 @@ where
 /// * `root_path` - The root path for the audio files.
 /// * `cancel_token` - An optional cancellation token to support task cancellation.
 fn analysis_file(
+    fsio: &FsIo,
     file: &media_files::Model,
     lib_path: &Path,
     computing_device: ComputingDevice,
@@ -113,6 +122,7 @@ fn analysis_file(
 
     // Perform audio analysis
     let analysis_result = analyze_audio(
+        fsio,
         file_path.to_str().expect("Unable to convert file path"),
         1024, // Example window size
         512,  // Example overlap size
@@ -138,7 +148,9 @@ fn analysis_file(
 /// * `result` - The normalized analysis result.
 async fn insert_analysis_result(
     main_db: &DatabaseConnection,
+    node_id: &str,
     file_id: i32,
+    file_hash: &str,
     result: NormalizedAnalysisResult,
 ) -> Result<()> {
     let mut new_analysis = media_analysis::ActiveModel {
@@ -155,6 +167,19 @@ async fn insert_analysis_result(
         spectral_kurtosis: ActiveValue::Set(Decimal::from_f32(result.spectral_kurtosis)),
         perceptual_spread: ActiveValue::Set(Decimal::from_f32(result.raw.perceptual_spread)),
         perceptual_sharpness: ActiveValue::Set(Decimal::from_f32(result.raw.perceptual_sharpness)),
+        hlc_uuid: ActiveValue::Set(
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                format!("RUNE_ANALYSIS::{file_hash}").as_bytes(),
+            )
+            .to_string(),
+        ),
+        created_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
+        updated_at_hlc_ts: ActiveValue::Set(Utc::now().to_rfc3339()),
+        created_at_hlc_ver: ActiveValue::Set(0),
+        updated_at_hlc_ver: ActiveValue::Set(0),
+        created_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
+        updated_at_hlc_nid: ActiveValue::Set(node_id.to_owned()),
         ..Default::default()
     };
 

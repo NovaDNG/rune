@@ -5,9 +5,9 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use dunce::canonicalize;
 use sea_orm::DatabaseConnection;
 
+use fsio::FsIo;
 use playback::player::PlayingItem;
 
 use crate::actions::{
@@ -39,6 +39,7 @@ pub struct LibraryItemProcessor;
 impl PlayingFileMetadataProvider for LibraryItemProcessor {
     async fn get_file_handle(
         &self,
+        _fsio: &FsIo,
         main_db: &DatabaseConnection,
         items: &[PlayingItem],
     ) -> Result<Vec<MediaFileHandle>> {
@@ -53,17 +54,18 @@ impl PlayingFileMetadataProvider for LibraryItemProcessor {
 
     async fn get_file_path(
         &self,
+        fsio: &FsIo,
         lib_path: &Path,
         main_db: &DatabaseConnection,
         items: &[PlayingItem],
     ) -> Result<HashMap<PlayingItem, PathBuf>> {
-        let handles = self.get_file_handle(main_db, items).await?;
+        let handles = self.get_file_handle(fsio, main_db, items).await?;
 
         let mut result: HashMap<PlayingItem, PathBuf> = HashMap::new();
 
         for handle in handles {
-            let file_path = canonicalize(
-                Path::new(lib_path)
+            let file_path = fsio.canonicalize_path(
+                &Path::new(lib_path)
                     .join(handle.directory.clone())
                     .join(handle.file_name.clone()),
             )?;
@@ -76,6 +78,7 @@ impl PlayingFileMetadataProvider for LibraryItemProcessor {
 
     async fn get_metadata_summary(
         &self,
+        _fsio: &FsIo,
         main_db: &DatabaseConnection,
         items: &[PlayingItem],
     ) -> Result<Vec<PlayingItemMetadataSummary>> {
@@ -93,13 +96,15 @@ impl PlayingFileMetadataProvider for LibraryItemProcessor {
 
     async fn bake_cover_art(
         &self,
+        fsio: &FsIo,
+        _lib_path: &Path,
         main_db: &DatabaseConnection,
         items: &[PlayingItem],
     ) -> Result<HashMap<PlayingItem, String>> {
         let in_library_ids = extract_in_library_ids(items.to_vec());
 
         let result: HashMap<i32, String> =
-            bake_cover_art_by_file_ids(main_db, in_library_ids).await?;
+            bake_cover_art_by_file_ids(fsio, main_db, in_library_ids).await?;
 
         let mut converted_result = HashMap::new();
 
@@ -112,23 +117,24 @@ impl PlayingFileMetadataProvider for LibraryItemProcessor {
 
     async fn get_cover_art_primary_color(
         &self,
+        _fsio: &FsIo,
+        _lib_path: &Path,
         main_db: &DatabaseConnection,
         item: &PlayingItem,
     ) -> Option<i32> {
-        match item {
-            PlayingItem::InLibrary(track_id) => {
-                if let Some(id) = get_cover_art_id_by_track_id(main_db, *track_id)
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    get_primary_color_by_cover_art_id(main_db, id).await.ok()
-                } else {
-                    None
-                }
-            }
-            PlayingItem::IndependentFile(_) => None,
-            PlayingItem::Unknown => None,
-        }
+        let track_id = match item {
+            PlayingItem::InLibrary(id) => Some(*id),
+            PlayingItem::Online(_, Some(file)) => Some(file.id),
+            _ => None,
+        }?;
+
+        let cover_art_id = match get_cover_art_id_by_track_id(main_db, track_id).await {
+            Ok(Some(id)) => Some(id),
+            _ => None,
+        }?;
+
+        get_primary_color_by_cover_art_id(main_db, cover_art_id)
+            .await
+            .ok()
     }
 }

@@ -3,8 +3,6 @@
 let
   pkgsCross = nixpkgs.legacyPackages.x86_64-linux.pkgsCross.aarch64-multiplatform;
   rust-bin = rust-overlay.lib.mkRustBin { } pkgsCross.buildPackages;
-
-  expidusPkgs = import masterPkgs { inherit system; };
 in
 pkgsCross.callPackage (
   {
@@ -22,6 +20,7 @@ pkgsCross.callPackage (
     sqlite,
     clippy,
     rust-analyzer,
+    flutter,
     rustup,
     mount,
     protobuf_26,
@@ -55,7 +54,7 @@ pkgsCross.callPackage (
       clang
       cmake
       binutils
-      expidusPkgs.flutter
+      flutter
       clippy
       rust-analyzer
       rustup
@@ -99,7 +98,6 @@ pkgsCross.callPackage (
     shellHook = ''
       alias ls=exa
       alias find=fd
-      alias rinf='flutter pub run rinf'
       alias build='flutter-elinux build elinux --target-arch=arm64'
       export PATH=$HOME/.cargo/bin:$HOME/.pub-cache/bin:$PATH
       export LDFLAGS="-L${stdenv.cc.cc.lib}/lib -L${wayland}/lib $LDFLAGS"

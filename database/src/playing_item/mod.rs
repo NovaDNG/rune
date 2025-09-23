@@ -1,6 +1,7 @@
 pub mod dispatcher;
 pub mod independent_file;
 pub mod library_item;
+pub mod online_file;
 
 use std::{
     collections::HashMap,
@@ -10,6 +11,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
+use fsio::FsIo;
 use sea_orm::DatabaseConnection;
 
 use metadata::describe::FileDescription;
@@ -41,7 +43,7 @@ impl From<media_files::Model> for MediaFileHandle {
 impl From<FileDescription> for MediaFileHandle {
     fn from(x: FileDescription) -> Self {
         MediaFileHandle {
-            item: PlayingItem::IndependentFile(x.full_path),
+            item: PlayingItem::IndependentFile(x.raw_path),
             file_name: x.file_name,
             directory: x.directory,
             extension: x.extension,
@@ -100,12 +102,14 @@ impl From<MetadataSummary> for PlayingItemMetadataSummary {
 pub trait PlayingFileMetadataProvider {
     async fn get_file_handle(
         &self,
+        fsio: &FsIo,
         main_db: &DatabaseConnection,
         items: &[PlayingItem],
     ) -> Result<Vec<MediaFileHandle>>;
 
     async fn get_file_path(
         &self,
+        fsio: &FsIo,
         lib_path: &Path,
         main_db: &DatabaseConnection,
         items: &[PlayingItem],
@@ -113,18 +117,23 @@ pub trait PlayingFileMetadataProvider {
 
     async fn get_metadata_summary(
         &self,
+        fsio: &FsIo,
         main_db: &DatabaseConnection,
         items: &[PlayingItem],
     ) -> Result<Vec<PlayingItemMetadataSummary>>;
 
     async fn bake_cover_art(
         &self,
+        fsio: &FsIo,
+        lib_path: &Path,
         main_db: &DatabaseConnection,
         items: &[PlayingItem],
     ) -> Result<HashMap<PlayingItem, String>>;
 
     async fn get_cover_art_primary_color(
         &self,
+        fsio: &FsIo,
+        lib_path: &Path,
         main_db: &DatabaseConnection,
         item: &PlayingItem,
     ) -> Option<i32>;

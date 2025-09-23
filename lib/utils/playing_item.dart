@@ -1,4 +1,4 @@
-import '../messages/all.dart';
+import '../bindings/bindings.dart';
 
 class PlayingItem {
   final int? inLibrary;
@@ -14,12 +14,21 @@ class PlayingItem {
   const PlayingItem.unknown() : this._(isUnknown: true);
 
   static PlayingItem fromRequest(PlayingItemRequest request) {
-    if (request.inLibrary.fileId != 0) {
-      return PlayingItem.inLibrary(request.inLibrary.fileId);
-    } else if (request.independentFile.path != "") {
-      return PlayingItem.independentFile(request.independentFile.path);
-    } else {
+    final inLibrary = request.inLibrary;
+
+    if (inLibrary == null) {
       return PlayingItem.unknown();
+    } else {
+      final fileId = inLibrary.fileId;
+      final independentFile = request.independentFile;
+
+      if (fileId != 0) {
+        return PlayingItem.inLibrary(fileId);
+      } else if (independentFile != null) {
+        return PlayingItem.independentFile(independentFile.rawPath);
+      } else {
+        return PlayingItem.unknown();
+      }
     }
   }
 
@@ -70,17 +79,17 @@ extension PlayingItemExtension on PlayingItem {
     if (inLibrary != null) {
       return PlayingItemRequest(
         inLibrary: InLibraryPlayingItem(fileId: inLibrary!),
-        independentFile: IndependentFilePlayingItem(path: null),
+        independentFile: null,
       );
     } else if (independentFile != null) {
       return PlayingItemRequest(
-        inLibrary: InLibraryPlayingItem(fileId: null),
-        independentFile: IndependentFilePlayingItem(path: independentFile!),
+        inLibrary: null,
+        independentFile: IndependentFilePlayingItem(rawPath: independentFile!),
       );
     } else {
       return PlayingItemRequest(
-        inLibrary: InLibraryPlayingItem(fileId: null),
-        independentFile: IndependentFilePlayingItem(path: null),
+        inLibrary: null,
+        independentFile: null,
       );
     }
   }

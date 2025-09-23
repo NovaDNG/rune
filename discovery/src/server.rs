@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use log::error;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 use crate::persistent::{PersistenceError, PersistentDataManager};
 use crate::utils::DeviceType;
@@ -130,7 +130,7 @@ impl PermissionManager {
     ///
     /// # Arguments
     /// * `path` - The base path under which the permission data will be stored.
-    ///            A subdirectory `.known-clients` will be created under this path for storing permission data.
+    ///   A subdirectory `.known-clients` will be created under this path for storing permission data.
     ///
     /// # Returns
     /// `Result<Self, PermissionError>` - A `Result` containing the new `PermissionManager` instance,
@@ -246,11 +246,10 @@ impl PermissionManager {
             })
             .await?;
 
-        if let Some(user) = self.verify_by_fingerprint(&fingerprint_clone).await {
-            if user.status != UserStatus::Blocked && user.status != UserStatus::Approved {
+        if let Some(user) = self.verify_by_fingerprint(&fingerprint_clone).await
+            && user.status != UserStatus::Blocked && user.status != UserStatus::Approved {
                 let _ = self.request_sender.send(user.clone());
             }
-        }
 
         Ok(())
     }

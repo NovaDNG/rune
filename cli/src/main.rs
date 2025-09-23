@@ -1,21 +1,30 @@
+use std::{fs, path::PathBuf, sync::Arc};
+
 use clap::{Parser, Subcommand};
+use directories::ProjectDirs;
 use dunce::canonicalize;
 use log::{error, info};
-use prettytable::{row, Table};
-use std::path::PathBuf;
+use prettytable::{Table, row};
 use tracing_subscriber::filter::EnvFilter;
 
-use database::actions::cover_art::scan_cover_arts;
-use database::actions::metadata::{
-    empty_progress_callback, get_metadata_summary_by_file_ids, scan_audio_library,
+use database::{
+    actions::{
+        cover_art::scan_cover_arts,
+        metadata::{empty_progress_callback, get_metadata_summary_by_file_ids, scan_audio_library},
+        search::search_for,
+    },
+    connection::{connect_main_db, connect_recommendation_db},
 };
-use database::actions::search::search_for;
-use database::connection::{connect_main_db, connect_recommendation_db};
-use rune::analysis::*;
-use rune::index::index_audio_library;
-use rune::mix::{mixes, RecommendMixOptions};
-use rune::playback::*;
-use rune::recommend::*;
+use fsio::FsIo;
+
+use rune::{
+    analysis::*,
+    index::index_audio_library,
+    mix::{RecommendMixOptions, mixes},
+    playback::*,
+    recommend::*,
+};
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "Media Manager")]
@@ -132,10 +141,23 @@ async fn main() {
     // Determine the path from either the option or the positional argument
     let path = cli.library.expect("Path is required");
 
+    let proj_dirs = ProjectDirs::from("ci", "not", "rune").unwrap();
+
+    let config_dir = proj_dirs.config_dir();
+    let config_path = config_dir.to_path_buf();
+
+    if config_path.exists() {
+        if config_path.is_file() {
+            panic!("Config directory path is a file: {config_path:?}");
+        }
+    } else {
+        fs::create_dir_all(&config_path).unwrap();
+    }
+
     let canonicalized_path = match canonicalize(&path) {
         Ok(path) => path,
         Err(e) => {
-            error!("Failed to canonicalize path: {}", e);
+            error!("Failed to canonicalize path: {e}");
             return;
         }
     };
@@ -147,40 +169,88 @@ async fn main() {
             return;
         }
     };
+    let fsio = Arc::new(FsIo::new());
 
     // TODO: INTEGRATING THE CLIENT ID LATER
-    let main_db = match connect_main_db(lib_path, None, "").await {
+    let main_db = match connect_main_db(&fsio, lib_path, None, "").await {
         Ok(db) => db,
         Err(e) => {
-            error!("Failed to connect to main database: {}", e);
+            error!("Failed to connect to main database: {e}");
             return;
         }
     };
 
-    let analysis_db = match connect_recommendation_db(lib_path, None) {
+    let analysis_db = match connect_recommendation_db(&fsio, lib_path, None).await {
         Ok(db) => db,
         Err(e) => {
-            error!("Failed to connect to analysis database: {}", e);
+            error!("Failed to connect to analysis database: {e}");
             return;
         }
     };
+
+    let nid_path = config_path.join("nid");
+
+    fsio.ensure_file(&nid_path).await.unwrap();
+    info!("Checking nid file at: {nid_path:?}");
+
+    let content = fsio.read_to_string(&nid_path);
+    let node_id = match content {
+        Ok(content) => {
+            let trimmed = content.trim();
+            match Uuid::parse_str(trimmed) {
+                Ok(uuid) => {
+                    info!("Found valid UUID: {uuid}");
+                    uuid
+                }
+                Err(_) => {
+                    info!("Invalid UUID in nid file, generating new one");
+                    let new_uuid = Uuid::new_v4();
+                    fsio.write_string(&nid_path, &new_uuid.to_string())
+                        .await
+                        .unwrap();
+                    new_uuid
+                }
+            }
+        }
+        Err(_) => {
+            info!("nid file not found, creating new one");
+            let new_uuid = Uuid::new_v4();
+            fsio.write_string(&nid_path, &new_uuid.to_string())
+                .await
+                .unwrap();
+            new_uuid
+        }
+    }
+    .to_string();
 
     match &cli.command {
         Commands::Scan => {
-            let _ = scan_audio_library(&main_db, &path, true, false, empty_progress_callback, None)
-                .await;
-            let _ = scan_cover_arts(&main_db, &path, "", 10, |_now, _total| {}, None).await;
+            let _ = scan_audio_library(
+                &fsio,
+                &main_db,
+                &node_id,
+                &path,
+                true,
+                false,
+                empty_progress_callback,
+                None,
+            )
+            .await;
+            let _ =
+                scan_cover_arts(fsio, &main_db, &path, &node_id, 10, |_now, _total| {}, None).await;
             info!("Library scanned successfully.");
         }
         Commands::Index => {
-            index_audio_library(&main_db).await;
+            index_audio_library(&main_db, &node_id).await;
         }
         Commands::Analyze { computing_device } => {
             analyze_audio_library(
                 computing_device.as_str().into(),
+                fsio,
                 &main_db,
                 &analysis_db,
                 &path,
+                "",
             )
             .await;
         }
@@ -213,7 +283,7 @@ async fn main() {
                     table.printstd();
                 }
                 Err(e) => {
-                    error!("Failed to retrieve metadata summary: {}", e);
+                    error!("Failed to retrieve metadata summary: {e}");
                 }
             }
         }
@@ -276,11 +346,11 @@ async fn main() {
         Commands::Search { query, num } => match search_for(&main_db, query, None, *num).await {
             Ok(results) => {
                 for (collection_type, ids) in results {
-                    info!("{:?}: {:?}", collection_type, ids);
+                    info!("{collection_type:?}: {ids:?}");
                 }
             }
             Err(e) => {
-                error!("Search failed: {}", e);
+                error!("Search failed: {e}");
             }
         },
     }

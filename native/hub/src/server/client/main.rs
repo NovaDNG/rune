@@ -10,7 +10,7 @@ pub mod verify;
 
 use std::{process::exit, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use log::{error, info};
 use regex::Regex;
@@ -21,17 +21,15 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 
-use hub::server::utils::path::get_config_dir;
-
-use ::discovery::{client::CertValidator, protocol::DiscoveryService};
+use ::discovery::{client::CertValidator, config::get_config_dir, protocol::DiscoveryService};
 
 use cli::{Cli, DiscoveryCmd, RemoteCmd, ReplCommand};
 use connection::WSConnection;
-use editor::{create_editor, EditorConfig};
+use editor::{EditorConfig, create_editor};
 use fs::VirtualFS;
 use utils::{
-    get_fingerprint_by_index, print_certificate_table, print_device_details, print_device_table,
-    AppState,
+    AppState, get_fingerprint_by_index, print_certificate_table, print_device_details,
+    print_device_table,
 };
 use verify::{inspect_host, print_device_information, register_current_device, verify_servers};
 
@@ -40,7 +38,7 @@ async fn main() -> Result<()> {
     setup_logging()?;
 
     if let Err(e) = default_provider().install_default() {
-        bail!(format!("{:#?}", e));
+        bail!(format!("{e:#?}"));
     };
 
     let cli = Cli::parse();
@@ -56,20 +54,20 @@ async fn repl_mode(service_url: &str) -> Result<()> {
     let service_url = match validate_and_format_url(service_url) {
         Ok(x) => x,
         Err(e) => {
-            error!("{}", e);
+            error!("{e}");
             return Ok(());
         }
     };
 
     println!("Welcome to the Rune Speaker Command Line Interface");
-    println!("Service URL: {}", service_url);
+    println!("Service URL: {service_url}");
     println!("\nType 'help' to see available commands");
 
     let config = EditorConfig::default();
     let connection = match WSConnection::connect(service_url.clone()).await {
         Ok(x) => x,
         Err(e) => {
-            error!("{}", e);
+            error!("{e}");
             return Ok(());
         }
     };
@@ -109,9 +107,9 @@ async fn repl_mode(service_url: &str) -> Result<()> {
                     }
                     Err(err) => {
                         if !err.use_stderr() {
-                            println!("{}", err);
+                            println!("{err}");
                         } else {
-                            eprintln!("Error: {}", err);
+                            eprintln!("Error: {err}");
                         }
                     }
                 }
@@ -123,7 +121,7 @@ async fn repl_mode(service_url: &str) -> Result<()> {
                     break;
                 }
                 _ => {
-                    eprintln!("Error: {:?}", err);
+                    eprintln!("Error: {err:?}");
                     break;
                 }
             },
@@ -246,7 +244,7 @@ async fn handle_remote_command(cmd: RemoteCmd) -> Result<()> {
                 let hosts = validator.get_hosts_for_fingerprint(&fingerprint).await;
 
                 if hosts.is_empty() {
-                    info!("No hosts associated with fingerprint {}", fingerprint);
+                    info!("No hosts associated with fingerprint {fingerprint}");
                     return Ok(());
                 }
 
@@ -303,7 +301,7 @@ fn validate_and_format_url(input: &str) -> Result<String> {
             ));
         }
 
-        Ok(format!("ws://{}:{}/ws", host, port))
+        Ok(format!("ws://{host}:{port}/ws"))
     } else {
         Err(anyhow!("Invalid URL format"))
     }

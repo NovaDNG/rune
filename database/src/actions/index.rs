@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Error, Result};
+use chrono::Utc;
 use log::{error, info};
 use migration::OnConflict;
-use sea_orm::{prelude::*, DatabaseTransaction, QuerySelect};
 use sea_orm::{DatabaseConnection, Set, TransactionTrait};
+use sea_orm::{DatabaseTransaction, QuerySelect, prelude::*};
 use tokio_util::sync::CancellationToken;
 
 use crate::actions::collection::CollectionQueryType;
@@ -14,7 +15,7 @@ use crate::entities::{
     albums, artists, genres, media_file_albums, media_file_artists, media_file_genres, media_files,
 };
 
-use super::metadata::{get_metadata_summary_by_file_ids, MetadataSummary};
+use super::metadata::{MetadataSummary, get_metadata_summary_by_file_ids};
 
 /// Indexes media files by processing their metadata and updating database records for artists, albums, and genres.
 ///
@@ -34,17 +35,18 @@ use super::metadata::{get_metadata_summary_by_file_ids, MetadataSummary};
 /// Returns `Ok(())` if the indexing process is successful, or an `Err(Error)` if any error occurs.
 pub async fn index_media_files(
     main_db: &DatabaseConnection,
+    node_id: &str,
     file_ids: Vec<i32>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<()> {
-    info!("Indexing media: {:?}", file_ids);
+    info!("Indexing media: {file_ids:?}");
 
     // Check for cancellation before starting any processing.
-    if let Some(token) = &cancel_token {
-        if token.is_cancelled() {
-            info!("Operation cancelled before starting.");
-            return Ok(());
-        }
+    if let Some(token) = &cancel_token
+        && token.is_cancelled()
+    {
+        info!("Operation cancelled before starting.");
+        return Ok(());
     }
 
     // Retrieve metadata summaries for the given file IDs.
@@ -55,26 +57,26 @@ pub async fn index_media_files(
         let txn = match main_db.begin().await {
             Ok(txn) => txn,
             Err(e) => {
-                error!("Failed to start transaction: {}", e);
+                error!("Failed to start transaction: {e}");
                 continue; // Proceed to the next file if transaction start fails.
             }
         };
 
         // Check for cancellation during processing of each file.
-        if let Some(token) = &cancel_token {
-            if token.is_cancelled() {
-                info!("Operation cancelled during processing.");
-                let _ = txn.rollback().await; // Rollback the current transaction if cancelled.
-                return Ok(());
-            }
+        if let Some(token) = &cancel_token
+            && token.is_cancelled()
+        {
+            info!("Operation cancelled during processing.");
+            let _ = txn.rollback().await; // Rollback the current transaction if cancelled.
+            return Ok(());
         }
 
         // Process artists for the current media file.
-        let artist_result = process_artists(&txn, &summary, cancel_token).await;
+        let artist_result = process_artists(&txn, node_id, &summary, cancel_token).await;
         // Process album for the current media file.
-        let album_result = process_album(&txn, &summary).await;
+        let album_result = process_album(&txn, node_id, &summary).await;
         // Process genres for the current media file.
-        let genre_result = process_genres(&txn, &summary, cancel_token).await;
+        let genre_result = process_genres(&txn, node_id, &summary, cancel_token).await;
 
         // Commit transaction if all processing is successful, otherwise rollback.
         match (artist_result, album_result, genre_result) {
@@ -110,6 +112,7 @@ pub async fn index_media_files(
 /// Returns `Ok(())` if artist processing is successful, or an `Err(Error)` if any error occurs.
 async fn process_artists(
     txn: &DatabaseTransaction,
+    node_id: &str,
     summary: &MetadataSummary,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<()> {
@@ -129,10 +132,10 @@ async fn process_artists(
     }
 
     // Check for cancellation token.
-    if let Some(token) = cancel_token {
-        if token.is_cancelled() {
-            return Err(Error::msg("Operation cancelled"));
-        }
+    if let Some(token) = cancel_token
+        && token.is_cancelled()
+    {
+        return Err(Error::msg("Operation cancelled"));
     }
 
     // Fetch existing artists from the database that match the artist names from metadata.
@@ -161,6 +164,13 @@ async fn process_artists(
                 artists::ActiveModel {
                     name: Set(name.clone()),                // Set artist name.
                     group: Set(generate_group_name(&name)), // Generate group name for artist.
+                    hlc_uuid: Set(Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()).to_string()),
+                    created_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                    updated_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                    created_at_hlc_ver: Set(0),
+                    updated_at_hlc_ver: Set(0),
+                    created_at_hlc_nid: Set(node_id.to_owned()),
+                    updated_at_hlc_nid: Set(node_id.to_owned()),
                     ..Default::default()
                 }
             }))
@@ -187,7 +197,7 @@ async fn process_artists(
         if !existing_map.contains_key(&artist.name) {
             add_term(txn, CollectionQueryType::Artist, artist.id, &artist.name).await?;
         }
-        artist_ids.push(artist.id);
+        artist_ids.push((artist.id, artist.hlc_uuid));
     }
 
     // Clean up existing artist associations for the media file before creating new ones.
@@ -198,13 +208,27 @@ async fn process_artists(
 
     // Insert new artist associations for the media file.
     if !artist_ids.is_empty() {
-        media_file_artists::Entity::insert_many(artist_ids.into_iter().map(|artist_id| {
-            media_file_artists::ActiveModel {
-                media_file_id: Set(summary.id), // Set media file ID.
-                artist_id: Set(artist_id),      // Set artist ID.
-                ..Default::default()
-            }
-        }))
+        media_file_artists::Entity::insert_many(artist_ids.into_iter().map(
+            |(artist_id, artist_hlc_uuld)| {
+                media_file_artists::ActiveModel {
+                    media_file_id: Set(summary.id), // Set media file ID.
+                    artist_id: Set(artist_id),      // Set artist ID.
+                    hlc_uuid: Set(Uuid::new_v5(
+                        &Uuid::NAMESPACE_OID,
+                        format!("RUNE_ARTIST_FILE::{artist_hlc_uuld}::{}", summary.file_hash)
+                            .as_bytes(),
+                    )
+                    .to_string()),
+                    created_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                    updated_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                    created_at_hlc_ver: Set(0),
+                    updated_at_hlc_ver: Set(0),
+                    created_at_hlc_nid: Set(node_id.to_owned()),
+                    updated_at_hlc_nid: Set(node_id.to_owned()),
+                    ..Default::default()
+                }
+            },
+        ))
         .exec(txn)
         .await?;
     }
@@ -226,13 +250,12 @@ async fn process_artists(
 /// # Returns
 ///
 /// Returns `Ok(())` if album processing is successful, or an `Err(Error)` if any error occurs.
-async fn process_album(txn: &DatabaseTransaction, summary: &MetadataSummary) -> Result<()> {
+async fn process_album(
+    txn: &DatabaseTransaction,
+    node_id: &str,
+    summary: &MetadataSummary,
+) -> Result<()> {
     let album_name = &summary.album;
-    let album = albums::ActiveModel {
-        name: Set(album_name.clone()),               // Set album name.
-        group: Set(generate_group_name(album_name)), // Generate group name for album.
-        ..Default::default()
-    };
 
     // Check if the album already exists in the database.
     let existing_album = albums::Entity::find()
@@ -240,9 +263,28 @@ async fn process_album(txn: &DatabaseTransaction, summary: &MetadataSummary) -> 
         .one(txn)
         .await?;
 
-    let album_id = match existing_album {
-        Some(existing) => existing.id, // Use existing album ID if found.
+    let (album_id, album_hlc_uuid) = match existing_album {
+        Some(existing) => (existing.id, existing.hlc_uuid), // Use existing album ID if found.
         None => {
+            let hlc_uuid = Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                format!("RUNE_ALBUM::{album_name}").as_bytes(),
+            )
+            .to_string();
+
+            let album = albums::ActiveModel {
+                name: Set(album_name.clone()),               // Set album name.
+                group: Set(generate_group_name(album_name)), // Generate group name for album.
+                hlc_uuid: Set(hlc_uuid.clone()),
+                created_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                updated_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                created_at_hlc_ver: Set(0),
+                updated_at_hlc_ver: Set(0),
+                created_at_hlc_nid: Set(node_id.to_owned()),
+                updated_at_hlc_nid: Set(node_id.to_owned()),
+                ..Default::default()
+            };
+
             // Insert the new album if it doesn't exist.
             let inserted_album = albums::Entity::insert(album).exec(txn).await?;
             // Add search term for the newly inserted album.
@@ -253,7 +295,7 @@ async fn process_album(txn: &DatabaseTransaction, summary: &MetadataSummary) -> 
                 album_name,
             )
             .await?;
-            inserted_album.last_insert_id // Return the new album ID.
+            (inserted_album.last_insert_id, hlc_uuid) // Return the new album ID.
         }
     };
 
@@ -268,6 +310,17 @@ async fn process_album(txn: &DatabaseTransaction, summary: &MetadataSummary) -> 
         media_file_id: Set(summary.id),                // Set media file ID.
         album_id: Set(album_id),                       // Set album ID.
         track_number: Set(Some(summary.track_number)), // Set track number from metadata.
+        hlc_uuid: Set(Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("RUNE_ALBUM_FILE::{album_hlc_uuid}::{}", summary.file_hash).as_bytes(),
+        )
+        .to_string()),
+        created_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+        updated_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+        created_at_hlc_ver: Set(0),
+        updated_at_hlc_ver: Set(0),
+        created_at_hlc_nid: Set(node_id.to_owned()),
+        updated_at_hlc_nid: Set(node_id.to_owned()),
         ..Default::default()
     })
     .exec(txn)
@@ -293,6 +346,7 @@ async fn process_album(txn: &DatabaseTransaction, summary: &MetadataSummary) -> 
 /// Returns `Ok(())` if genre processing is successful, or an `Err(Error)` if any error occurs.
 async fn process_genres(
     txn: &DatabaseTransaction,
+    node_id: &str,
     summary: &MetadataSummary,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<()> {
@@ -312,10 +366,10 @@ async fn process_genres(
     }
 
     // Check for cancellation token.
-    if let Some(token) = cancel_token {
-        if token.is_cancelled() {
-            return Err(Error::msg("Operation cancelled"));
-        }
+    if let Some(token) = cancel_token
+        && token.is_cancelled()
+    {
+        return Err(Error::msg("Operation cancelled"));
     }
 
     // Fetch existing genres from the database that match the genre names from metadata.
@@ -344,6 +398,17 @@ async fn process_genres(
                 genres::ActiveModel {
                     name: Set(name.clone()),                // Set genre name.
                     group: Set(generate_group_name(&name)), // Generate group name for genre.
+                    hlc_uuid: Set(Uuid::new_v5(
+                        &Uuid::NAMESPACE_OID,
+                        format!("RUNE_GENRES::{name}").as_bytes(),
+                    )
+                    .to_string()),
+                    created_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                    updated_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                    created_at_hlc_ver: Set(0),
+                    updated_at_hlc_ver: Set(0),
+                    created_at_hlc_nid: Set(node_id.to_owned()),
+                    updated_at_hlc_nid: Set(node_id.to_owned()),
                     ..Default::default()
                 }
             }))
@@ -370,7 +435,7 @@ async fn process_genres(
         if !existing_map.contains_key(&genre.name) {
             add_term(txn, CollectionQueryType::Genre, genre.id, &genre.name).await?;
         }
-        genre_ids.push(genre.id);
+        genre_ids.push((genre.id, genre.hlc_uuid));
     }
 
     // Clean up existing genre associations for the media file before creating new ones.
@@ -381,13 +446,27 @@ async fn process_genres(
 
     // Insert new genre associations for the media file.
     if !genre_ids.is_empty() {
-        media_file_genres::Entity::insert_many(genre_ids.into_iter().map(|genre_id| {
-            media_file_genres::ActiveModel {
-                media_file_id: Set(summary.id), // Set media file ID.
-                genre_id: Set(genre_id),        // Set genre ID.
-                ..Default::default()
-            }
-        }))
+        media_file_genres::Entity::insert_many(genre_ids.into_iter().map(
+            |(genre_id, genre_hlc_uuid)| {
+                media_file_genres::ActiveModel {
+                    media_file_id: Set(summary.id), // Set media file ID.
+                    genre_id: Set(genre_id),        // Set genre ID.
+                    hlc_uuid: Set(Uuid::new_v5(
+                        &Uuid::NAMESPACE_OID,
+                        format!("RUNE_GENRES_FILE::{genre_hlc_uuid}::{}", summary.file_hash)
+                            .as_bytes(),
+                    )
+                    .to_string()),
+                    created_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                    updated_at_hlc_ts: Set(Utc::now().to_rfc3339()),
+                    created_at_hlc_ver: Set(0),
+                    updated_at_hlc_ver: Set(0),
+                    created_at_hlc_nid: Set(node_id.to_owned()),
+                    updated_at_hlc_nid: Set(node_id.to_owned()),
+                    ..Default::default()
+                }
+            },
+        ))
         .exec(txn)
         .await?;
     }
@@ -413,6 +492,7 @@ async fn process_genres(
 /// Returns `Ok(())` if the library indexing is successful, or an `Err(Error)` if any error occurs.
 pub async fn index_audio_library(
     main_db: &DatabaseConnection,
+    node_id: &str,
     batch_size: usize,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<()> {
@@ -459,13 +539,13 @@ pub async fn index_audio_library(
 
             // Process the batch when it reaches the specified batch size.
             if file_ids.len() >= batch_size {
-                process_batch(main_db, &mut file_ids, cancel_token).await?; // Process the current batch.
+                process_batch(main_db, node_id, &mut file_ids, cancel_token).await?; // Process the current batch.
             }
         }
 
         // Process any remaining files in the last batch after the channel is closed.
         if !file_ids.is_empty() {
-            process_batch(main_db, &mut file_ids, cancel_token).await?; // Process the last batch.
+            process_batch(main_db, node_id, &mut file_ids, cancel_token).await?; // Process the last batch.
         }
 
         Ok::<(), Error>(())
@@ -502,12 +582,13 @@ pub async fn index_audio_library(
 /// Returns `Ok(())` if batch processing is successful, or an `Err(Error)` if any error occurs.
 async fn process_batch(
     db: &DatabaseConnection,
+    node_id: &str,
     file_ids: &mut Vec<i32>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<()> {
     let batch = std::mem::take(file_ids); // Take ownership of the file IDs for processing and clear the original vector.
-    if let Err(e) = index_media_files(db, batch, cancel_token).await {
-        error!("Batch processing failed: {}", e); // Log error if batch processing fails.
+    if let Err(e) = index_media_files(db, node_id, batch, cancel_token).await {
+        error!("Batch processing failed: {e}"); // Log error if batch processing fails.
     }
     Ok(())
 }
@@ -601,10 +682,7 @@ pub async fn cleanup_orphaned_records(db: &DatabaseConnection) -> Result<()> {
         // 7.1 Remove search terms associated with orphaned artists.
         for artist_id in &artist_ids {
             if let Err(e) = remove_term(&txn, CollectionQueryType::Artist, *artist_id).await {
-                error!(
-                    "Failed to remove search terms for artist {}: {}",
-                    artist_id, e
-                );
+                error!("Failed to remove search terms for artist {artist_id}: {e}");
             }
         }
 
@@ -624,10 +702,7 @@ pub async fn cleanup_orphaned_records(db: &DatabaseConnection) -> Result<()> {
         // 8.1 Remove search terms associated with orphaned albums.
         for album_id in &album_ids {
             if let Err(e) = remove_term(&txn, CollectionQueryType::Album, *album_id).await {
-                error!(
-                    "Failed to remove search terms for album {}: {}",
-                    album_id, e
-                );
+                error!("Failed to remove search terms for album {album_id}: {e}");
             }
         }
 
@@ -647,10 +722,7 @@ pub async fn cleanup_orphaned_records(db: &DatabaseConnection) -> Result<()> {
         // 9.1 Remove search terms associated with orphaned genres.
         for genre_id in &genre_ids {
             if let Err(e) = remove_term(&txn, CollectionQueryType::Genre, *genre_id).await {
-                error!(
-                    "Failed to remove search terms for genre {}: {}",
-                    genre_id, e
-                );
+                error!("Failed to remove search terms for genre {genre_id}: {e}");
             }
         }
 
@@ -691,16 +763,16 @@ pub async fn perform_library_maintenance(
     info!("Starting library maintenance");
 
     // Check for cancellation before starting maintenance.
-    if let Some(token) = &cancel_token {
-        if token.is_cancelled() {
-            info!("Maintenance cancelled before starting");
-            return Ok(());
-        }
+    if let Some(token) = &cancel_token
+        && token.is_cancelled()
+    {
+        info!("Maintenance cancelled before starting");
+        return Ok(());
     }
 
     // Clean up orphaned records.
     if let Err(e) = cleanup_orphaned_records(db).await {
-        error!("Failed to clean up orphaned records: {}", e);
+        error!("Failed to clean up orphaned records: {e}");
         return Err(e);
     }
 

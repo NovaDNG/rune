@@ -74,11 +74,11 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 #[cfg(not(test))]
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 #[cfg(test)]
-use std::{println as info, println as warn, println as error, println as debug};
+use std::{println as info, println as warn, println as error};
 
 use sea_orm::entity::prelude::*;
 use sea_orm::{
@@ -88,11 +88,11 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::chunking::{break_data_chunk, generate_data_chunks, ChunkingOptions, DataChunk};
+use crate::chunking::{ChunkingOptions, DataChunk, break_data_chunk, generate_data_chunks};
 use crate::foreign_key::{
     ActiveModelWithForeignKeyOps, FkPayload, ForeignKeyResolver, ModelWithForeignKeyOps,
 };
-use crate::hlc::{HLCModel, HLCQuery, HLCRecord, SyncTaskContext, HLC};
+use crate::hlc::{HLC, HLCModel, HLCQuery, HLCRecord, SyncTaskContext};
 use crate::utils::merge_fk_mappings;
 
 /// If a chunk pair has differing hashes, but the maximum record count
@@ -305,6 +305,7 @@ enum ReconciliationItem {
     ChunkPair(Box<DataChunk>, Box<DataChunk>), // (Local Chunk, Remote Chunk)
     /// An HLC range for which individual records need to be fetched from both local and remote sources.
     FetchRange(ComparisonRange),
+    DeleteChunk(Box<DataChunk>, bool),
 }
 
 /// Performs synchronization for a single table between the local node and the remote source.
@@ -375,7 +376,7 @@ where
     );
 
     // Ensure remote node ID is obtained early for conflict resolution tie-breaking
-    let remote_node_id = context
+    let _remote_node_id = context
         .remote_source
         .get_remote_node_id()
         .await
@@ -384,23 +385,19 @@ where
     // 1. Fetch Initial Chunks
     // Fetch local and remote chunk metadata for data modified *after* the last sync HLC.
     let sync_start_hlc = metadata.last_sync_hlc.clone();
-    let local_chunks_fut = generate_data_chunks::<E, FKR>(
-        context.db,
-        &context.chunking_options,
-        Some(sync_start_hlc.clone()),
-        fk_resolver,
-    );
+    let local_chunks_fut =
+        generate_data_chunks::<E, FKR>(context.db, &context.chunking_options, None, fk_resolver);
     let remote_chunks_fut = context
         .remote_source
-        .get_remote_chunks::<E>(table_name, Some(&sync_start_hlc));
+        .get_remote_chunks::<E>(table_name, None);
 
     // Execute futures concurrently
     let (local_chunks_res, remote_chunks_res) = tokio::join!(local_chunks_fut, remote_chunks_fut);
 
     let mut local_chunks = local_chunks_res
-        .with_context(|| format!("Failed to generate local chunks for table '{}'", table_name))?;
+        .with_context(|| format!("Failed to generate local chunks for table '{table_name}'"))?;
     let mut remote_chunks = remote_chunks_res
-        .with_context(|| format!("Failed to fetch remote chunks for table '{}'", table_name))?;
+        .with_context(|| format!("Failed to fetch remote chunks for table '{table_name}'"))?;
 
     // Sort chunks by start HLC for efficient alignment
     local_chunks.sort_by(|a, b| a.start_hlc.cmp(&b.start_hlc));
@@ -408,7 +405,7 @@ where
 
     let remote_fk_mappings = merge_fk_mappings(&remote_chunks);
 
-    debug!(
+    info!(
         "Table '{}': Found {} local chunks, {} remote chunks after HLC {}",
         table_name,
         local_chunks.len(),
@@ -416,35 +413,39 @@ where
         sync_start_hlc
     );
 
-    println!("Local Chunks for '{}': {:?}", table_name, local_chunks);
-    println!("Remote Chunks for '{}': {:?}", table_name, remote_chunks);
-
     // 2. Reconcile Chunk Differences Recursively/Iteratively
     // Initialize lists to store records that need detailed comparison
     let mut local_records_to_compare: Vec<E::Model> = Vec::new();
     let mut remote_records_to_compare: Vec<E::Model> = Vec::new();
     // Track the maximum HLC encountered across all processed chunks/records
-    let mut max_hlc_encountered = sync_start_hlc.clone();
+    let mut max_hlc_encountered = metadata.last_sync_hlc.clone();
 
     // Use a queue for iterative processing of ranges/chunks needing reconciliation
     let mut reconciliation_queue: VecDeque<ReconciliationItem> = VecDeque::new();
+
+    // Operation lists, to be populated during reconciliation and comparison.
+    let mut local_ops: Vec<SyncOperation<E::Model>> = Vec::new();
+    let mut remote_ops: Vec<SyncOperation<E::Model>> = Vec::new();
 
     // Align the top-level chunks and populate the initial reconciliation queue
     align_and_queue_chunks(
         local_chunks,
         remote_chunks,
         &mut reconciliation_queue,
+        &metadata.last_sync_hlc,
         &mut max_hlc_encountered,
     );
 
-    debug!("** ** RECONCILIATION_QUEUE: {:#?}", reconciliation_queue);
+    info!("** ** RECONCILIATION_QUEUE: {reconciliation_queue:#?}");
+
+    info!("Reconciliation queue: {reconciliation_queue:?}");
 
     // Process the reconciliation queue until empty
     while let Some(item) = reconciliation_queue.pop_front() {
         match item {
             ReconciliationItem::FetchRange(range) => {
                 // This range requires fetching individual records
-                debug!(
+                info!(
                     "Processing FetchRange: [{}-{}]",
                     range.start_hlc, range.end_hlc
                 );
@@ -461,7 +462,7 @@ where
                 );
                 let (local_res, remote_res) = tokio::join!(local_fut, remote_fut);
 
-                debug!("** ** FETCH RANGE: LOCAL {:#?}", local_res);
+                info!("** ** FETCH RANGE: LOCAL {local_res:#?}");
 
                 // Extend the comparison lists, propagating errors
                 local_records_to_compare.extend(local_res.with_context(|| {
@@ -477,13 +478,58 @@ where
                     )
                 })?;
 
-                debug!("** ** FETCH RANGE: LOCAL {:#?}", remote_res);
+                info!("** ** FETCH RANGE: LOCAL {remote_res:#?}");
 
                 remote_records_to_compare.extend(remote_res.records);
             }
+            ReconciliationItem::DeleteChunk(chunk, is_local) => {
+                if is_local {
+                    // This chunk exists locally, but not remotely. And it's old.
+                    // This means the records were deleted on the remote. We should delete them locally too.
+                    info!(
+                        "Processing DeleteChunk (local): [{}-{}]",
+                        chunk.start_hlc, chunk.end_hlc
+                    );
+                    let records_to_delete = fetch_local_records_in_range::<E>(
+                        context.db,
+                        &chunk.start_hlc,
+                        &chunk.end_hlc,
+                    )
+                    .await?;
+                    for record in records_to_delete {
+                        if context.sync_direction == SyncDirection::Pull
+                            || context.sync_direction == SyncDirection::Bidirectional
+                        {
+                            local_ops.push(SyncOperation::DeleteLocal(record.unique_id()));
+                        }
+                    }
+                } else {
+                    // This chunk exists remotely, but not locally. And it's old.
+                    // This means the records were deleted on the local side. We should delete them on remote too.
+                    info!(
+                        "Processing DeleteChunk (remote): [{}-{}]",
+                        chunk.start_hlc, chunk.end_hlc
+                    );
+                    let records_to_delete = context
+                        .remote_source
+                        .get_remote_records_in_hlc_range::<E>(
+                            table_name,
+                            &chunk.start_hlc,
+                            &chunk.end_hlc,
+                        )
+                        .await?;
+                    for record in records_to_delete.records {
+                        if context.sync_direction == SyncDirection::Push
+                            || context.sync_direction == SyncDirection::Bidirectional
+                        {
+                            remote_ops.push(SyncOperation::DeleteRemote(record.unique_id()));
+                        }
+                    }
+                }
+            }
             ReconciliationItem::ChunkPair(local_chunk, remote_chunk) => {
                 // This pair represents aligned chunks with differing hashes
-                debug!(
+                info!(
                     "Processing ChunkPair: [{}-{}] (Hash L: {:.8}, Hash R: {:.8})",
                     local_chunk.start_hlc,
                     local_chunk.end_hlc,
@@ -510,9 +556,13 @@ where
                 if max_count == 0 {
                     // Both chunks reported 0 count but hashes differed. This is weird.
                     // Hash of empty should be consistent. Fetch range to be safe.
-                    warn!("ChunkPair has 0 count but differing hashes for range [{}-{}] L:'{}' R:'{}'. Fetching range.",
-                          local_chunk.start_hlc, local_chunk.end_hlc,
-                          local_chunk.chunk_hash, remote_chunk.chunk_hash);
+                    warn!(
+                        "ChunkPair has 0 count but differing hashes for range [{}-{}] L:'{}' R:'{}'. Fetching range.",
+                        local_chunk.start_hlc,
+                        local_chunk.end_hlc,
+                        local_chunk.chunk_hash,
+                        remote_chunk.chunk_hash
+                    );
                     reconciliation_queue.push_back(ReconciliationItem::FetchRange(
                         ComparisonRange {
                             start_hlc: local_chunk.start_hlc.clone(),
@@ -521,7 +571,7 @@ where
                     ));
                 } else if max_count <= COMPARISON_THRESHOLD {
                     // Count is small enough, fetch individual records for this range
-                    debug!(
+                    info!(
                         "Chunk count ({}) <= threshold ({}). Adding FetchRange [{}-{}].",
                         max_count, COMPARISON_THRESHOLD, local_chunk.start_hlc, local_chunk.end_hlc
                     );
@@ -533,7 +583,7 @@ where
                     ));
                 } else {
                     // Count is too large, break down the chunk recursively
-                    debug!(
+                    info!(
                         "Chunk count ({}) > threshold ({}). Breaking down chunk [{}-{}].",
                         max_count, COMPARISON_THRESHOLD, local_chunk.start_hlc, local_chunk.end_hlc
                     );
@@ -573,10 +623,12 @@ where
                             local_subs.sort_by(|a, b| a.start_hlc.cmp(&b.start_hlc));
                             remote_subs.sort_by(|a, b| a.start_hlc.cmp(&b.start_hlc));
 
-                            debug!(
+                            info!(
                                 "Successfully broke down chunk [{}-{}] into {} local and {} remote sub-chunks. Aligning sub-chunks.",
-                                local_chunk.start_hlc, local_chunk.end_hlc,
-                                local_subs.len(), remote_subs.len()
+                                local_chunk.start_hlc,
+                                local_chunk.end_hlc,
+                                local_subs.len(),
+                                remote_subs.len()
                             );
 
                             // Align and queue the generated sub-chunks for further processing
@@ -584,13 +636,16 @@ where
                                 local_subs,
                                 remote_subs,
                                 &mut reconciliation_queue,
+                                &metadata.last_sync_hlc,
                                 &mut max_hlc_encountered, // Pass down max_hlc_encountered
                             );
                         }
                         (Err(e), _) => {
                             // Failed to break down the local chunk (verification likely failed)
-                            error!("Failed to break down local chunk [{}-{}]: {:?}. Falling back to FetchRange.",
-                                   local_chunk.start_hlc, local_chunk.end_hlc, e);
+                            error!(
+                                "Failed to break down local chunk [{}-{}]: {:?}. Falling back to FetchRange.",
+                                local_chunk.start_hlc, local_chunk.end_hlc, e
+                            );
                             // Fallback: Fetch all records for the original parent chunk range
                             reconciliation_queue.push_back(ReconciliationItem::FetchRange(
                                 ComparisonRange {
@@ -601,8 +656,10 @@ where
                         }
                         (_, Err(e)) => {
                             // Failed to get sub-chunks from the remote side
-                            error!("Failed to get remote sub-chunks for parent range [{}-{}]: {:?}. Falling back to FetchRange.",
-                                   local_chunk.start_hlc, local_chunk.end_hlc, e);
+                            error!(
+                                "Failed to get remote sub-chunks for parent range [{}-{}]: {:?}. Falling back to FetchRange.",
+                                local_chunk.start_hlc, local_chunk.end_hlc, e
+                            );
                             // Fallback: Fetch all records for the original parent chunk range
                             reconciliation_queue.push_back(ReconciliationItem::FetchRange(
                                 ComparisonRange {
@@ -617,7 +674,7 @@ where
         }
     } // End of reconciliation queue processing loop
 
-    debug!(
+    info!(
         "Finished chunk reconciliation for table '{}'. Comparing {} local and {} remote records.",
         table_name,
         local_records_to_compare.len(),
@@ -676,7 +733,7 @@ where
         unique_map.into_values().collect::<Vec<_>>()
     };
 
-    debug!(
+    info!(
         "After deduplication: {} local and {} remote records for table '{}'.",
         local_records_to_compare.len(),
         remote_records_to_compare.len(),
@@ -695,10 +752,7 @@ where
         if let Some(hlc) = local_record.updated_at_hlc() {
             update_max_hlc(&mut max_hlc_encountered, &hlc);
         } else {
-            warn!(
-                "Local record {} missing updated_at_hlc during comparison phase.",
-                key
-            );
+            warn!("Local record {key} missing updated_at_hlc during comparison phase.");
             // Skip this record or handle error? Skipping for now.
             continue;
         }
@@ -712,10 +766,7 @@ where
         if let Some(hlc) = remote_record.updated_at_hlc() {
             update_max_hlc(&mut max_hlc_encountered, &hlc);
         } else {
-            warn!(
-                "Remote record {} missing updated_at_hlc during comparison phase.",
-                key
-            );
+            warn!("Remote record {key} missing updated_at_hlc during comparison phase.");
             // Skip this record or handle error? Skipping for now.
             continue;
         }
@@ -736,59 +787,99 @@ where
     // 4. Conflict Resolution and Operation Generation
     // Iterate through the merged record states and determine the appropriate SyncOperation
     // based on the state, HLC comparison, Node ID tie-breaking, and SyncDirection.
-    let mut local_ops: Vec<SyncOperation<E::Model>> = Vec::new();
-    let mut remote_ops: Vec<SyncOperation<E::Model>> = Vec::new();
 
     for (_key, state) in comparison_map {
         match state {
             RecordSyncState::LocalOnly(local_record) => {
                 // Record only exists locally
                 let id = local_record.unique_id();
-                println!("Conflict Resolution: Record {} is LocalOnly. Direction: {:?}. Generating InsertRemote.", id, context.sync_direction);
-                if context.sync_direction == SyncDirection::Push
-                    || context.sync_direction == SyncDirection::Bidirectional
-                {
-                    let fk_payload = if let Some(resolver) = &fk_resolver {
-                        resolver
-                            .extract_foreign_key_sync_ids(&local_record, context.db)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "Failed to extract FK sync_ids for local-only record {}",
-                                    id
-                                )
-                            })?
+                if let Some(local_hlc) = local_record.updated_at_hlc() {
+                    if local_hlc <= metadata.last_sync_hlc {
+                        info!(
+                            "Conflict Resolution: Record {id} is LocalOnly but was created before last sync. It was deleted on remote. Generating DeleteLocal."
+                        );
+                        if context.sync_direction == SyncDirection::Pull
+                            || context.sync_direction == SyncDirection::Bidirectional
+                        {
+                            local_ops.push(SyncOperation::DeleteLocal(id));
+                        } else {
+                            // In Push-only mode, if local has a record that remote deleted, we respect the remote's deletion
+                            // by doing nothing to the remote, but we also don't re-insert it.
+                            // A NoOp for remote is appropriate.
+                            remote_ops.push(SyncOperation::NoOp(id));
+                        }
                     } else {
-                        FkPayload::new()
-                    };
-
-                    // Push local record to remote
-                    remote_ops.push(SyncOperation::InsertRemote(local_record, fk_payload));
+                        // Record's created_at is newer than last_sync_hlc, so it's a genuine new record.
+                        info!(
+                            "Conflict Resolution: Record {} is LocalOnly and new. Direction: {:?}. Generating InsertRemote.",
+                            id, context.sync_direction
+                        );
+                        if context.sync_direction == SyncDirection::Push
+                            || context.sync_direction == SyncDirection::Bidirectional
+                        {
+                            let fk_payload = if let Some(resolver) = &fk_resolver {
+                                resolver
+                                    .extract_foreign_key_sync_ids(&local_record, context.db)
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "Failed to extract FK sync_ids for local-only record {id}"
+                                        )
+                                    })?
+                            } else {
+                                FkPayload::new()
+                            };
+                            remote_ops.push(SyncOperation::InsertRemote(local_record, fk_payload));
+                        } else {
+                            // In Pull-only, we don't push new local records.
+                            local_ops.push(SyncOperation::NoOp(id));
+                        }
+                    }
                 } else {
-                    // Pull only, do nothing locally or remotely for this record
+                    warn!("LocalOnly record {id} has no HLC, cannot process.");
                     local_ops.push(SyncOperation::NoOp(id));
                 }
             }
             RecordSyncState::RemoteOnly(remote_record) => {
                 // Record only exists remotely
                 let id = remote_record.unique_id();
-                debug!("Conflict Resolution: Record {} is RemoteOnly.", id);
-                if context.sync_direction == SyncDirection::Pull
-                    || context.sync_direction == SyncDirection::Bidirectional
-                {
-                    let fk_payload = if let Some(resolver) = &fk_resolver {
-                        resolver.extract_sync_ids_from_remote_model_with_mapping(
-                            &remote_record,
-                            Some(&remote_fk_mappings),
-                        )?
+                if let Some(remote_hlc) = remote_record.updated_at_hlc() {
+                    if remote_hlc <= metadata.last_sync_hlc {
+                        info!(
+                            "Conflict Resolution: Record {id} is RemoteOnly but was created before last sync. It was deleted on local. Generating DeleteRemote."
+                        );
+                        if context.sync_direction == SyncDirection::Push
+                            || context.sync_direction == SyncDirection::Bidirectional
+                        {
+                            remote_ops.push(SyncOperation::DeleteRemote(id));
+                        } else {
+                            // In Pull-only, if remote has a record that local deleted, respect local's deletion.
+                            local_ops.push(SyncOperation::NoOp(id));
+                        }
                     } else {
-                        FkPayload::new()
-                    };
-
-                    // Pull remote record to local
-                    local_ops.push(SyncOperation::InsertLocal(remote_record, fk_payload));
+                        // Record's created_at is newer than last_sync_hlc, so it's a genuine new record from remote.
+                        info!(
+                            "Conflict Resolution: Record {id} is RemoteOnly and new. Generating InsertLocal."
+                        );
+                        if context.sync_direction == SyncDirection::Pull
+                            || context.sync_direction == SyncDirection::Bidirectional
+                        {
+                            let fk_payload = if let Some(resolver) = &fk_resolver {
+                                resolver.extract_sync_ids_from_remote_model_with_mapping(
+                                    &remote_record,
+                                    Some(&remote_fk_mappings),
+                                )?
+                            } else {
+                                FkPayload::new()
+                            };
+                            local_ops.push(SyncOperation::InsertLocal(remote_record, fk_payload));
+                        } else {
+                            // In Push-only, we don't pull new remote records.
+                            remote_ops.push(SyncOperation::NoOp(id));
+                        }
+                    }
                 } else {
-                    // Push only, do nothing locally or remotely for this record
+                    warn!("RemoteOnly record {id} has no HLC, cannot process.");
                     remote_ops.push(SyncOperation::NoOp(id));
                 }
             }
@@ -808,51 +899,27 @@ where
                     )
                 })?;
 
-                debug!(
-                    "Conflict Resolution: Record {} is Both (Local HLC: {}, Remote HLC: {})",
-                    id, local_hlc, remote_hlc
+                info!(
+                    "Conflict Resolution: Record {id} is Both (Local HLC: {local_hlc}, Remote HLC: {remote_hlc})"
                 );
 
-                // Compare timestamp and version first
-                let ts_ver_cmp = (local_hlc.timestamp_ms, local_hlc.version)
-                    .cmp(&(remote_hlc.timestamp_ms, remote_hlc.version));
-
-                let (local_wins, remote_wins) = match ts_ver_cmp {
-                    std::cmp::Ordering::Greater => {
-                        debug!(":: Local TS/Version is greater.");
-                        (true, false) // Local wins based on TS/Version
-                    }
-                    std::cmp::Ordering::Less => {
-                        debug!(":: Remote TS/Version is greater.");
-                        (false, true) // Remote wins based on TS/Version
-                    }
-                    std::cmp::Ordering::Equal => {
-                        // Timestamps and Versions are identical, use Node ID as tie-breaker
-                        debug!(
-                            ":: TS/Version are equal. Tie-breaking using Node IDs (Local: {}, Remote: {}).",
-                            context.local_node_id, remote_node_id
-                        );
-                        // Explicitly compare node IDs now
-                        match context.local_node_id.cmp(&remote_node_id) {
-                            std::cmp::Ordering::Less => {
-                                debug!(":: Local Node ID wins tie-breaker.");
-                                (true, false) // Local wins tie-breaker
-                            }
-                            std::cmp::Ordering::Equal => {
-                                // Node IDs are identical? Should not happen with UUIDs unless clocks synced *perfectly*
-                                // and somehow produced the exact same record state.
-                                // Treat as NoOp as the HLCs (and likely data) are identical.
-                                warn!(
-                                    "Identical HLCs (including Node ID: {}) found for record {}. Treating as NoOp.",
-                                    context.local_node_id, id
-                                );
-                                (false, false) // No winner, effectively NoOp
-                            }
-                            std::cmp::Ordering::Greater => {
-                                debug!(":: Remote Node ID wins tie-breaker.");
-                                (false, true) // Remote wins tie-breaker
-                            }
-                        }
+                let (local_wins, remote_wins) = {
+                    if local_hlc.timestamp_ms > remote_hlc.timestamp_ms {
+                        (true, false)
+                    } else if local_hlc.timestamp_ms < remote_hlc.timestamp_ms {
+                        (false, true)
+                    } else if local_hlc.version > remote_hlc.version {
+                        (true, false)
+                    } else if local_hlc.version < remote_hlc.version {
+                        (false, true)
+                    } else if local_hlc.node_id < remote_hlc.node_id {
+                        (true, false)
+                    } else if local_hlc.node_id > remote_hlc.node_id {
+                        (false, true)
+                    } else {
+                        // HLCs are identical. The data is different (otherwise hashes would match).
+                        // Deterministically choose local to win.
+                        (true, false)
                     }
                 };
 
@@ -865,15 +932,14 @@ where
                         // If local won (either by TS/Version or tie-breaker), push the update.
                         // The previous complex check is simplified because `local_wins` already
                         // incorporates the necessary comparison logic (including tie-breaker).
-                        debug!(":: Action: UpdateRemote with local winner.");
+                        info!(":: Action: UpdateRemote with local winner.");
                         let fk_payload = if let Some(resolver) = &fk_resolver {
                             resolver
                                 .extract_foreign_key_sync_ids(&local_record, context.db)
                                 .await
                                 .with_context(|| {
                                     format!(
-                                        "Failed to extract FK sync_ids for local winning record {}",
-                                        id
+                                        "Failed to extract FK sync_ids for local winning record {id}"
                                     )
                                 })?
                         } else {
@@ -896,7 +962,7 @@ where
                         || context.sync_direction == SyncDirection::Bidirectional
                     {
                         // If remote won, update local.
-                        debug!(":: Action: UpdateLocal with remote winner.");
+                        info!(":: Action: UpdateLocal with remote winner.");
 
                         let fk_payload = if let Some(resolver) = &fk_resolver {
                             resolver.extract_sync_ids_from_remote_model_with_mapping(
@@ -919,7 +985,7 @@ where
                     remote_ops.push(SyncOperation::NoOp(id));
                 } else {
                     // No winner (e.g., identical HLC including Node ID)
-                    debug!(":: No clear winner or records identical. Action: NoOp for both.");
+                    info!(":: No clear winner or records identical. Action: NoOp for both.");
                     local_ops.push(SyncOperation::NoOp(id.clone()));
                     remote_ops.push(SyncOperation::NoOp(id));
                 }
@@ -930,12 +996,10 @@ where
     // 5. Apply Changes Transactionally
     let final_sync_hlc = max_hlc_encountered.clone();
 
-    println!(
-        "Operations generated for table '{}'. Local Ops: {:?}, Remote Ops: {:?}",
-        table_name, local_ops, remote_ops
-    );
+    info!("Generated local operations: {local_ops:?}");
+    info!("Generated remote operations: {remote_ops:?}");
 
-    debug!(
+    info!(
         "Applying changes for table '{}'. {} local ops, {} remote ops. Target HLC: {}",
         table_name,
         local_ops.len(),
@@ -976,9 +1040,8 @@ where
                     .await
                     .context("Failed to apply remote changes")
             } else {
-                debug!(
-                    "No remote changes to apply or sync direction prevents it for table '{}'.",
-                    table_name
+                info!(
+                    "No remote changes to apply or sync direction prevents it for table '{table_name}'."
                 );
                 // If no remote ops needed, return the calculated final HLC as "achieved"
                 Ok(final_sync_hlc.clone())
@@ -987,13 +1050,11 @@ where
         Err(e) => {
             // Local changes failed, abort sync for this table
             error!(
-                "Failed to apply local changes for table '{}': {:?}. Aborting sync for this table.",
-                table_name, e
+                "Failed to apply local changes for table '{table_name}': {e:?}. Aborting sync for this table."
             );
             // Propagate the error
             Err(e).context(format!(
-                "Local changes application failed for table '{}'",
-                table_name
+                "Local changes application failed for table '{table_name}'"
             ))
         }
     };
@@ -1007,8 +1068,7 @@ where
             let new_last_sync_hlc = std::cmp::max(final_sync_hlc, achieved_remote_hlc);
 
             info!(
-                "Sync successful for table '{}'. Updating last_sync_hlc to: {}",
-                table_name, new_last_sync_hlc
+                "Sync successful for table '{table_name}'. Updating last_sync_hlc to: {new_last_sync_hlc}"
             );
             // Return the new metadata to be persisted by the caller
             Ok(SyncTableMetadata {
@@ -1019,13 +1079,11 @@ where
         Err(e) => {
             // Remote changes failed (or local failed earlier and error propagated)
             error!(
-                "Sync failed for table '{}' during remote changes application: {:?}. Metadata not updated.",
-                table_name, e
+                "Sync failed for table '{table_name}' during remote changes application: {e:?}. Metadata not updated."
             );
             // Propagate the error, indicating sync failure for this table
             Err(e).context(format!(
-                "Sync failed for table '{}' during changes application",
-                table_name
+                "Sync failed for table '{table_name}' during changes application"
             ))
         }
     }
@@ -1064,7 +1122,7 @@ where
         .collect();
 
     if ops_to_apply.is_empty() {
-        debug!("No local operations to apply.");
+        info!("No local operations to apply.");
         return Ok(());
     }
 
@@ -1074,7 +1132,7 @@ where
         .begin()
         .await
         .context("Failed to begin local transaction")?;
-    debug!(
+    info!(
         "Applying {} local operations within transaction.",
         ops_to_apply.len()
     );
@@ -1083,7 +1141,7 @@ where
         match op {
             SyncOperation::InsertLocal(model, fk_payload) => {
                 let id_str = model.unique_id(); // Get ID for logging before move
-                debug!("Local TXN: Inserting record ID {}", id_str);
+                info!("Local TXN: Inserting record ID {id_str}");
                 // Convert Model to the Entity's specific ActiveModel
                 let mut active_model: E::ActiveModel = model.into_active_model();
 
@@ -1095,95 +1153,70 @@ where
                             &txn, // Use transaction for lookups
                         )
                         .await
-                        .with_context(|| format!("Failed to remap FKs for insert of {}", id_str))?;
+                        .with_context(|| format!("Failed to remap FKs for insert of {id_str}"))?;
                 }
 
                 // Ensure PK is NotSet or Default if auto-incrementing
                 E::insert(active_model)
                     .exec(&txn)
                     .await
-                    .with_context(|| format!("Failed to insert local record ID {}", id_str))?;
+                    .with_context(|| format!("Failed to insert local record ID {id_str}"))?;
             }
             SyncOperation::UpdateLocal(model, fk_payload) => {
                 let id_str = model.unique_id();
-                debug!("Local TXN: Updating record ID {}", id_str);
+                info!("Local TXN: Updating record ID {id_str} via delete and insert");
 
-                // 1. Convert the incoming model to ActiveModel.
-                //    This ActiveModel might contain an incorrect primary key value
-                //    inherited from the `model` (e.g., if it came from remote).
-                let mut am_from_model: E::ActiveModel = model.into_active_model();
+                // First, delete the existing record by its unique ID
+                let delete_result = E::delete_many()
+                    .filter(E::unique_id_column().eq(id_str.clone()))
+                    .exec(&txn)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to delete local record for update: {id_str}")
+                    })?;
 
-                // 2. Reset the primary key field(s) in the ActiveModel.
-                //    This sets the PK fields to `NotSet`, ensuring that the `set`
-                //    operation below does not attempt to modify the primary key itself.
-                //    The filter condition will target the correct row.
-                //    Requires E::PrimaryKey: Into<E::Column> bound.
+                if delete_result.rows_affected == 0 {
+                    warn!(
+                        "While updating {id_str}, the existing record was not found for deletion. Proceeding with insert."
+                    );
+                }
+
+                // Second, insert the new version of the record
+                let mut active_model: E::ActiveModel = model.into_active_model();
+
+                // Reset the primary key to allow the database to generate a new one.
+                // This is crucial because we are re-inserting.
                 for pk_col in E::PrimaryKey::iter() {
-                    am_from_model.reset(pk_col.into_column());
+                    active_model.reset(pk_col.into_column());
                 }
 
                 if let Some(resolver) = &fk_resolver {
                     resolver
-                        .remap_and_set_foreign_keys(
-                            &mut am_from_model, // Apply FK remapping to this AM
-                            &fk_payload,
-                            &txn,
-                        )
+                        .remap_and_set_foreign_keys(&mut active_model, &fk_payload, &txn)
                         .await
-                        .with_context(|| format!("Failed to remap FKs for update of {}", id_str))?;
+                        .with_context(|| {
+                            format!("Failed to remap FKs for insert-on-update of {id_str}")
+                        })?;
                 }
 
-                // 3. Perform the update using `update_many` (even for a single row).
-                //    Filter by the logical unique ID (`sync_id` in tests).
-                //    The `set` method applies only the fields that are `Set`
-                //    in `am_from_model` (which now excludes the PKs).
-                let update_result = E::update_many()
-                    .set(am_from_model) // Apply the changes (PK field is NotSet)
-                    .filter(E::unique_id_column().eq(id_str.clone())) // Use ColumnTrait::eq
-                    .exec(&txn)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to update local record with unique ID {}", id_str)
-                    })?;
+                E::insert(active_model).exec(&txn).await.with_context(|| {
+                    format!("Failed to insert local record for update: {id_str}")
+                })?;
 
-                // 4. Check if any row was actually updated.
-                if update_result.rows_affected == 0 {
-                    // This implies the record with the given unique_id didn't exist locally.
-                    // This could happen if a remote delete won a conflict resolution
-                    // against a local update, but the delete hasn't been processed yet,
-                    // or indicates some other inconsistency.
-                    warn!(
-                        "Local TXN: Update operation for unique ID {} affected 0 rows. Record might not exist locally or was already deleted.",
-                        id_str
-                    );
-                } else if update_result.rows_affected > 1 {
-                    // This should ideally not happen if unique_id_column has a unique constraint.
-                    warn!(
-                        "Local TXN: Update operation for unique ID {} affected {} rows. Expected 1.",
-                        id_str, update_result.rows_affected
-                    );
-                } else {
-                    debug!(
-                        "Local TXN: Successfully updated 1 row for unique ID {}",
-                        id_str
-                    );
-                }
+                info!("Local TXN: Successfully updated (re-inserted) record ID {id_str}");
             }
             SyncOperation::DeleteLocal(id_str) => {
-                debug!("Local TXN: Deleting record ID {}", id_str);
+                info!("Local TXN: Deleting record ID {id_str}");
                 let delete_result = E::delete_many()
                     // Filter using the unique_id column and the string ID directly
                     .filter(E::unique_id_column().eq(id_str.clone()))
                     .exec(&txn)
                     .await
-                    .with_context(|| format!("Failed to delete local record {}", id_str))?;
+                    .with_context(|| format!("Failed to delete local record {id_str}"))?;
 
                 // Use delete_many with filter, consistent with update
                 if delete_result.rows_affected == 0 {
-                    warn!(
-                        "Local TXN: Delete operation for ID {} affected 0 rows.",
-                        id_str
-                    );
+                    warn!("Local TXN: Delete operation for ID {id_str} affected 0 rows.");
                 }
             }
             SyncOperation::NoOp(_) => { /* Already filtered out */ }
@@ -1200,7 +1233,7 @@ where
     txn.commit()
         .await
         .context("Failed to commit local transaction")?;
-    debug!("Local transaction committed successfully.");
+    info!("Local transaction committed successfully.");
     Ok(())
 }
 
@@ -1214,6 +1247,7 @@ fn align_and_queue_chunks(
     local_chunks: Vec<DataChunk>,
     remote_chunks: Vec<DataChunk>,
     queue: &mut VecDeque<ReconciliationItem>,
+    last_sync_hlc: &HLC,
     max_hlc_encountered: &mut HLC, // Pass mutable ref to update max HLC
 ) {
     let mut local_idx = 0;
@@ -1233,28 +1267,46 @@ fn align_and_queue_chunks(
                 // Compare chunks based on start HLC first for alignment
                 match local.start_hlc.cmp(&remote.start_hlc) {
                     std::cmp::Ordering::Less => {
-                        // Local chunk starts earlier -> Assume local-only range for now
-                        debug!(
-                            "Align: Local chunk [{}-{}] starts first. Queueing FetchRange.",
+                        // Local chunk starts earlier -> This range is local-only.
+                        info!(
+                            "Align: Local chunk [{}-{}] starts first. Queueing as local-only.",
                             local.start_hlc, local.end_hlc
                         );
-                        queue.push_back(ReconciliationItem::FetchRange(ComparisonRange {
-                            start_hlc: local.start_hlc.clone(),
-                            end_hlc: local.end_hlc.clone(),
-                        }));
-                        local_idx += 1; // Advance local index
+                        if local.end_hlc <= *last_sync_hlc {
+                            // Entirely old chunk, must have been deleted on remote.
+                            queue.push_back(ReconciliationItem::DeleteChunk(
+                                Box::new(local.clone()),
+                                true, // is_local
+                            ));
+                        } else {
+                            // Chunk is new or overlaps the sync boundary. Fetch to compare.
+                            queue.push_back(ReconciliationItem::FetchRange(ComparisonRange {
+                                start_hlc: local.start_hlc.clone(),
+                                end_hlc: local.end_hlc.clone(),
+                            }));
+                        }
+                        local_idx += 1;
                     }
                     std::cmp::Ordering::Greater => {
-                        // Remote chunk starts earlier -> Assume remote-only range for now
-                        debug!(
-                            "Align: Remote chunk [{}-{}] starts first. Queueing FetchRange.",
+                        // Remote chunk starts earlier -> This range is remote-only.
+                        info!(
+                            "Align: Remote chunk [{}-{}] starts first. Queueing as remote-only.",
                             remote.start_hlc, remote.end_hlc
                         );
-                        queue.push_back(ReconciliationItem::FetchRange(ComparisonRange {
-                            start_hlc: remote.start_hlc.clone(),
-                            end_hlc: remote.end_hlc.clone(),
-                        }));
-                        remote_idx += 1; // Advance remote index
+                        if remote.end_hlc <= *last_sync_hlc {
+                            // Entirely old chunk, must have been deleted on local.
+                            queue.push_back(ReconciliationItem::DeleteChunk(
+                                Box::new(remote.clone()),
+                                false, // !is_local
+                            ));
+                        } else {
+                            // Chunk is new or overlaps. Fetch to compare.
+                            queue.push_back(ReconciliationItem::FetchRange(ComparisonRange {
+                                start_hlc: remote.start_hlc.clone(),
+                                end_hlc: remote.end_hlc.clone(),
+                            }));
+                        }
+                        remote_idx += 1;
                     }
                     std::cmp::Ordering::Equal => {
                         // Start HLCs match, now compare end HLCs
@@ -1262,13 +1314,13 @@ fn align_and_queue_chunks(
                             // Perfect alignment: Start and End HLCs match
                             if local.chunk_hash == remote.chunk_hash {
                                 // Hashes match -> Chunks are identical, skip
-                                debug!(
+                                info!(
                                     "Align: Chunks perfectly aligned and hashes match for [{}-{}]. Skipping.",
                                     local.start_hlc, local.end_hlc
                                 );
                             } else {
                                 // Hashes differ -> Needs reconciliation
-                                debug!(
+                                info!(
                                     "Align: Chunks perfectly aligned, hashes differ for [{}-{}]. Queueing ChunkPair.",
                                     local.start_hlc, local.end_hlc
                                 );
@@ -1305,27 +1357,53 @@ fn align_and_queue_chunks(
             // Case 2: Only local chunks left
             (Some(local), None) => {
                 update_max_hlc(max_hlc_encountered, &local.end_hlc);
-                debug!(
-                    "Align: Remaining local chunk [{}-{}]. Queueing FetchRange.",
+                info!(
+                    "Align: Remaining local chunk [{}-{}]. Queueing as local-only.",
                     local.start_hlc, local.end_hlc
                 );
-                queue.push_back(ReconciliationItem::FetchRange(ComparisonRange {
-                    start_hlc: local.start_hlc.clone(),
-                    end_hlc: local.end_hlc.clone(),
-                }));
+                info!(
+                    "[CUSTOM_LOG] Align: Comparing local.end_hlc ({}) <= last_sync_hlc ({})",
+                    local.end_hlc, last_sync_hlc
+                );
+                if local.end_hlc <= *last_sync_hlc {
+                    // Entirely old chunk, must have been deleted on remote.
+                    queue.push_back(ReconciliationItem::DeleteChunk(
+                        Box::new(local.clone()),
+                        true, // is_local
+                    ));
+                } else {
+                    // Chunk is new or overlaps. Fetch to compare.
+                    queue.push_back(ReconciliationItem::FetchRange(ComparisonRange {
+                        start_hlc: local.start_hlc.clone(),
+                        end_hlc: local.end_hlc.clone(),
+                    }));
+                }
                 local_idx += 1;
             }
             // Case 3: Only remote chunks left
             (None, Some(remote)) => {
                 update_max_hlc(max_hlc_encountered, &remote.end_hlc);
-                debug!(
-                    "Align: Remaining remote chunk [{}-{}]. Queueing FetchRange.",
+                info!(
+                    "Align: Remaining remote chunk [{}-{}]. Queueing as remote-only.",
                     remote.start_hlc, remote.end_hlc
                 );
-                queue.push_back(ReconciliationItem::FetchRange(ComparisonRange {
-                    start_hlc: remote.start_hlc.clone(),
-                    end_hlc: remote.end_hlc.clone(),
-                }));
+                info!(
+                    "Align: Comparing remote.end_hlc ({}) <= last_sync_hlc ({})",
+                    remote.end_hlc, last_sync_hlc
+                );
+                if remote.end_hlc <= *last_sync_hlc {
+                    // Entirely old chunk, must have been deleted on local.
+                    queue.push_back(ReconciliationItem::DeleteChunk(
+                        Box::new(remote.clone()),
+                        false, // !is_local
+                    ));
+                } else {
+                    // Chunk is new or overlaps. Fetch to compare.
+                    queue.push_back(ReconciliationItem::FetchRange(ComparisonRange {
+                        start_hlc: remote.start_hlc.clone(),
+                        end_hlc: remote.end_hlc.clone(),
+                    }));
+                }
                 remote_idx += 1;
             }
             // Case 4: Both lists exhausted
@@ -1350,12 +1428,7 @@ where
         .order_by_hlc_asc::<E>()
         .all(db)
         .await
-        .with_context(|| {
-            format!(
-                "Failed to fetch local records after HLC {}",
-                start_hlc_exclusive
-            )
-        })
+        .with_context(|| format!("Failed to fetch local records after HLC {start_hlc_exclusive}"))
 }
 
 /// Helper to fetch local records within an inclusive HLC range.
@@ -1374,10 +1447,7 @@ where
         .all(db)
         .await
         .with_context(|| {
-            format!(
-                "Failed to fetch local records in HLC range [{}-{}]",
-                start_hlc, end_hlc
-            )
+            format!("Failed to fetch local records in HLC range [{start_hlc}-{end_hlc}]")
         })
 }
 
@@ -1431,9 +1501,9 @@ pub(crate) mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::chunking::{calculate_chunk_hash, ChunkFkMapping, ChunkingOptions, DataChunk};
+    use crate::chunking::{ChunkFkMapping, ChunkingOptions, DataChunk, calculate_chunk_hash};
     use crate::core::PrimaryKeyFromStr;
-    use crate::hlc::{HLCModel, HLCRecord, SyncTaskContext, HLC};
+    use crate::hlc::{HLC, HLCModel, HLCRecord, SyncTaskContext};
 
     #[derive(Debug)]
     pub(crate) struct NoOpForeignKeyResolver;
@@ -1479,7 +1549,7 @@ pub(crate) mod tests {
     pub(crate) mod test_entity {
         use std::str::FromStr;
 
-        use anyhow::{anyhow, Result};
+        use anyhow::{Result, anyhow};
         use async_trait::async_trait;
         use sea_orm::{
             ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter,
@@ -1487,7 +1557,7 @@ pub(crate) mod tests {
         use serde::{Deserialize, Serialize};
         use uuid::Uuid;
 
-        use crate::hlc::{HLCModel, HLCRecord, HLC};
+        use crate::hlc::{HLC, HLCModel, HLCRecord};
 
         use super::*;
 
@@ -1623,7 +1693,7 @@ pub(crate) mod tests {
                 s.parse::<i32>() // Parse as i32
                     .map_err(|e| {
                         anyhow!(e)
-                            .context(format!("Failed to parse primary key string '{}' as i32", s))
+                            .context(format!("Failed to parse primary key string '{s}' as i32"))
                     })
             }
         }
@@ -1748,8 +1818,7 @@ pub(crate) mod tests {
                     let model: M =
                         serde_json::from_value(record_json.clone()).with_context(|| {
                             format!(
-                                "Failed to deserialize mock record {} from table {}",
-                                sync_id, table_name
+                                "Failed to deserialize mock record {sync_id} from table {table_name}"
                             )
                         })?;
                     Ok(Some(model))
@@ -1833,14 +1902,14 @@ pub(crate) mod tests {
                 let record: E::Model =
                     serde_json::from_value(record_json.clone()).with_context(|| {
                         format!(
-                            "Failed to deserialize record for sub-chunking in table {}",
-                            table_name
+                            "Failed to deserialize record for sub-chunking in table {table_name}"
                         )
                     })?;
-                if let Some(hlc) = record.updated_at_hlc() {
-                    if hlc >= parent_chunk.start_hlc && hlc <= parent_chunk.end_hlc {
-                        records_in_range.push(record);
-                    }
+                if let Some(hlc) = record.updated_at_hlc()
+                    && hlc >= parent_chunk.start_hlc
+                    && hlc <= parent_chunk.end_hlc
+                {
+                    records_in_range.push(record);
                 }
             }
             records_in_range.sort_by_key(|m| m.updated_at_hlc());
@@ -1907,14 +1976,14 @@ pub(crate) mod tests {
                 let record: E::Model =
                     serde_json::from_value(record_json.clone()).with_context(|| {
                         format!(
-                            "Failed to deserialize record for HLC range fetch in table {}",
-                            table_name
+                            "Failed to deserialize record for HLC range fetch in table {table_name}"
                         )
                     })?;
-                if let Some(hlc) = record.updated_at_hlc() {
-                    if hlc >= *start_hlc && hlc <= *end_hlc {
-                        records.push(record);
-                    }
+                if let Some(hlc) = record.updated_at_hlc()
+                    && hlc >= *start_hlc
+                    && hlc <= *end_hlc
+                {
+                    records.push(record);
                 }
             }
             records.sort_by_key(|m| m.updated_at_hlc());
@@ -1929,7 +1998,7 @@ pub(crate) mod tests {
             table_name: &str,
             operations: Vec<SyncOperation<E::Model>>,
             _client_node_id: Uuid,
-            _new_last_sync_hlc: &HLC,
+            new_last_sync_hlc: &HLC,
         ) -> Result<HLC>
         where
             E: HLCModel + EntityTrait + Send + Sync,
@@ -1948,27 +2017,19 @@ pub(crate) mod tests {
             let mut ops_map_guard = self.applied_ops_by_table.lock().await;
             let table_ops_json = ops_map_guard.entry(table_name.to_string()).or_default();
 
-            let mut max_hlc = HLC::new(self.node_id);
-
             for op in operations {
                 let op_json = serde_json::to_value(&op).with_context(|| {
-                    format!("Failed to serialize SyncOperation for table {}", table_name)
+                    format!("Failed to serialize SyncOperation for table {table_name}")
                 })?;
                 table_ops_json.push(op_json);
 
                 match op {
                     SyncOperation::InsertRemote(model, _)
                     | SyncOperation::UpdateRemote(model, _) => {
-                        if let Some(hlc) = model.updated_at_hlc() {
-                            if hlc > max_hlc {
-                                max_hlc = hlc;
-                            }
-                        }
                         let model_sync_id = model.unique_id();
                         let model_json = serde_json::to_value(model).with_context(|| {
                             format!(
-                                "Failed to serialize model for remote storage in table {}",
-                                table_name
+                                "Failed to serialize model for remote storage in table {table_name}"
                             )
                         })?;
                         table_data.insert(model_sync_id, model_json);
@@ -1980,21 +2041,7 @@ pub(crate) mod tests {
                 }
             }
 
-            if table_ops_json.iter().any(|op_val| {
-                // Check if any "real" ops were processed
-                let op_type_str = op_val
-                    .as_object()
-                    .and_then(|o| o.keys().next())
-                    .map(|s| s.as_str());
-                matches!(
-                    op_type_str,
-                    Some("InsertRemote") | Some("UpdateRemote") | Some("DeleteRemote")
-                )
-            }) {
-                Ok(max_hlc)
-            } else {
-                Ok(HLC::new(self.node_id))
-            }
+            Ok(new_last_sync_hlc.clone())
         }
 
         async fn get_remote_last_sync_hlc(
@@ -2039,10 +2086,10 @@ pub(crate) mod tests {
             sync_id: Set(sync_id.to_string()),
             name: Set(name.to_string()),
             value: Set(val),
-            created_at_hlc_ts: Set(created_ts_str.clone()),
+            created_at_hlc_ts: Set(created_ts_str?.clone()),
             created_at_hlc_ct: Set(created_hlc.version as i32),
             created_at_hlc_id: Set(created_hlc.node_id),
-            updated_at_hlc_ts: Set(updated_ts_str.clone()),
+            updated_at_hlc_ts: Set(updated_ts_str?.clone()),
             updated_at_hlc_ct: Set(updated_hlc.version as i32),
             updated_at_hlc_id: Set(updated_hlc.node_id),
         };
@@ -2232,10 +2279,10 @@ pub(crate) mod tests {
             sync_id: "sync_remote1".to_string(),
             name: "NewRemote".to_string(),
             value: Some(2),
-            created_at_hlc_ts: hlc1.to_rfc3339(),
+            created_at_hlc_ts: hlc1.to_rfc3339()?,
             created_at_hlc_ct: hlc1.version as i32,
             created_at_hlc_id: hlc1.node_id,
-            updated_at_hlc_ts: hlc1.to_rfc3339(),
+            updated_at_hlc_ts: hlc1.to_rfc3339()?,
             updated_at_hlc_ct: hlc1.version as i32,
             updated_at_hlc_id: hlc1.node_id,
         };
@@ -2329,10 +2376,10 @@ pub(crate) mod tests {
             sync_id: "sync_conflict1".to_string(),
             name: "RemoteOld".to_string(),
             value: Some(99),
-            created_at_hlc_ts: hlc_remote_old.to_rfc3339(),
+            created_at_hlc_ts: hlc_remote_old.to_rfc3339()?,
             created_at_hlc_ct: hlc_remote_old.version as i32,
             created_at_hlc_id: hlc_remote_old.node_id,
-            updated_at_hlc_ts: hlc_remote_old.to_rfc3339(),
+            updated_at_hlc_ts: hlc_remote_old.to_rfc3339()?,
             updated_at_hlc_ct: hlc_remote_old.version as i32,
             updated_at_hlc_id: hlc_remote_old.node_id,
         };
@@ -2375,7 +2422,7 @@ pub(crate) mod tests {
             start_hlc: hlc_remote_old.clone(), // Remote chunk covers its older version
             end_hlc: hlc_remote_old.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[remote_record.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_record))?,
             fk_mappings: Default::default(),
         };
         remote_source
@@ -2427,7 +2474,7 @@ pub(crate) mod tests {
                 assert_eq!(model.name, "LocalWin");
                 assert_eq!(model.updated_at_hlc().unwrap(), hlc_local_new);
             }
-            op => panic!("Expected UpdateRemote operation, got {:?}", op),
+            op => panic!("Expected UpdateRemote operation, got {op:?}"),
         }
 
         let remote_record_after_sync: Option<test_entity::Model> = remote_source
@@ -2474,10 +2521,10 @@ pub(crate) mod tests {
             sync_id: "sync_conflict2".to_string(),
             name: "RemoteWin".to_string(),
             value: Some(100),
-            created_at_hlc_ts: hlc_local_old.to_rfc3339(), // Created at old hlc
+            created_at_hlc_ts: hlc_local_old.to_rfc3339()?, // Created at old hlc
             created_at_hlc_ct: hlc_local_old.version as i32,
             created_at_hlc_id: hlc_local_old.node_id,
-            updated_at_hlc_ts: hlc_remote_new.to_rfc3339(), // Updated to new hlc
+            updated_at_hlc_ts: hlc_remote_new.to_rfc3339()?, // Updated to new hlc
             updated_at_hlc_ct: hlc_remote_new.version as i32,
             updated_at_hlc_id: hlc_remote_new.node_id,
         };
@@ -2510,7 +2557,7 @@ pub(crate) mod tests {
             start_hlc: hlc_remote_new.clone(), // Remote chunk covers its newer version
             end_hlc: hlc_remote_new.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[remote_record.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_record))?,
             fk_mappings: Default::default(),
         };
         remote_source
@@ -2560,8 +2607,7 @@ pub(crate) mod tests {
                 || applied_ops
                     .iter()
                     .all(|op| matches!(op, SyncOperation::NoOp(_))),
-            "No real ops should be sent to remote, got: {:?}",
-            applied_ops
+            "No real ops should be sent to remote, got: {applied_ops:?}"
         );
 
         let local_final_data = test_entity::Entity::find().all(&db).await?;
@@ -2610,10 +2656,10 @@ pub(crate) mod tests {
             sync_id: "sync_tie1".to_string(),
             name: "RemoteTie".to_string(),
             value: Some(2),
-            created_at_hlc_ts: common_hlc_base_ts_ver.to_rfc3339(),
+            created_at_hlc_ts: common_hlc_base_ts_ver.to_rfc3339()?,
             created_at_hlc_ct: common_hlc_base_ts_ver.version as i32,
             created_at_hlc_id: common_hlc_base_ts_ver.node_id, // Could be either, doesn't affect tie-break logic for update
-            updated_at_hlc_ts: hlc_remote_tie.to_rfc3339(),
+            updated_at_hlc_ts: hlc_remote_tie.to_rfc3339()?,
             updated_at_hlc_ct: hlc_remote_tie.version as i32,
             updated_at_hlc_id: hlc_remote_tie.node_id,
         };
@@ -2683,7 +2729,7 @@ pub(crate) mod tests {
                 assert_eq!(model.name, "LocalTie");
                 assert_eq!(model.updated_at_hlc().unwrap(), hlc_local_tie);
             }
-            op => panic!("Expected UpdateRemote operation, got {:?}", op),
+            op => panic!("Expected UpdateRemote operation, got {op:?}"),
         }
 
         // MODIFIED: Use the new helper to check remote state
@@ -2729,10 +2775,10 @@ pub(crate) mod tests {
                     sync_id: "sync_i".to_string(),
                     name: "Inserted".to_string(),
                     value: Some(10),
-                    created_at_hlc_ts: hlc_i.to_rfc3339(),
+                    created_at_hlc_ts: hlc_i.to_rfc3339()?,
                     created_at_hlc_ct: hlc_i.version as i32,
                     created_at_hlc_id: hlc_i.node_id,
-                    updated_at_hlc_ts: hlc_i.to_rfc3339(),
+                    updated_at_hlc_ts: hlc_i.to_rfc3339()?,
                     updated_at_hlc_ct: hlc_i.version as i32,
                     updated_at_hlc_id: hlc_i.node_id,
                 },
@@ -2749,7 +2795,7 @@ pub(crate) mod tests {
                     created_at_hlc_ct: initial_record_u.created_at_hlc_ct,
                     created_at_hlc_id: initial_record_u.created_at_hlc_id,
                     // Set new update HLC fields
-                    updated_at_hlc_ts: hlc_u.to_rfc3339(),
+                    updated_at_hlc_ts: hlc_u.to_rfc3339()?,
                     updated_at_hlc_ct: hlc_u.version as i32,
                     updated_at_hlc_id: hlc_u.node_id,
                 },
@@ -2777,7 +2823,7 @@ pub(crate) mod tests {
         let final_data = Entity::find().order_by_asc(Column::SyncId).all(&db).await?; // Order by sync_id for consistent results
         assert_eq!(final_data.len(), 2); // sync_i and sync_u remain
 
-        println!("FINAL DATA: {:#?}", final_data);
+        println!("FINAL DATA: {final_data:#?}");
 
         assert_eq!(final_data[0].sync_id, "sync_i");
         assert_eq!(final_data[0].name, "Inserted");
@@ -2823,7 +2869,7 @@ pub(crate) mod tests {
                     created_at_hlc_ts: initial.created_at_hlc_ts.clone(),
                     created_at_hlc_ct: initial.created_at_hlc_ct,
                     created_at_hlc_id: initial.created_at_hlc_id,
-                    updated_at_hlc_ts: hlc_update_try.to_rfc3339(),
+                    updated_at_hlc_ts: hlc_update_try.to_rfc3339()?,
                     updated_at_hlc_ct: hlc_update_try.version as i32,
                     updated_at_hlc_id: hlc_update_try.node_id,
                 },
@@ -2836,10 +2882,10 @@ pub(crate) mod tests {
                     sync_id: "sync_dup".to_string(), // Duplicate unique key
                     name: "InsertedFail".to_string(),
                     value: Some(10),
-                    created_at_hlc_ts: hlc_insert_fail.to_rfc3339(),
+                    created_at_hlc_ts: hlc_insert_fail.to_rfc3339()?,
                     created_at_hlc_ct: hlc_insert_fail.version as i32,
                     created_at_hlc_id: hlc_insert_fail.node_id,
-                    updated_at_hlc_ts: hlc_insert_fail.to_rfc3339(),
+                    updated_at_hlc_ts: hlc_insert_fail.to_rfc3339()?,
                     updated_at_hlc_ct: hlc_insert_fail.version as i32,
                     updated_at_hlc_id: hlc_insert_fail.node_id,
                 },
@@ -2902,10 +2948,10 @@ pub(crate) mod tests {
             name: "RemoteData".to_string(),   // Different data -> different hash
             value: Some(2),
             // Use the same HLC components as the local record
-            created_at_hlc_ts: common_hlc.to_rfc3339(),
+            created_at_hlc_ts: common_hlc.to_rfc3339()?,
             created_at_hlc_ct: common_hlc.version as i32,
             created_at_hlc_id: common_hlc.node_id,
-            updated_at_hlc_ts: common_hlc.to_rfc3339(),
+            updated_at_hlc_ts: common_hlc.to_rfc3339()?,
             updated_at_hlc_ct: common_hlc.version as i32,
             updated_at_hlc_id: common_hlc.node_id,
         };
@@ -2932,7 +2978,7 @@ pub(crate) mod tests {
             start_hlc: common_hlc.clone(), // Chunk covers the record's HLC
             end_hlc: common_hlc.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[remote_record.clone()])?, // Hash based on remote data
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_record))?, // Hash based on remote data
             fk_mappings: Default::default(),
         };
         remote_source
@@ -3003,7 +3049,7 @@ pub(crate) mod tests {
                 assert_eq!(model.sync_id, "fetch_rec");
                 assert_eq!(model.name, "LocalData");
             }
-            op => panic!("Expected UpdateRemote, got {:?}", op),
+            op => panic!("Expected UpdateRemote, got {op:?}"),
         }
 
         let local_data = Entity::find().all(context.db).await?;
@@ -3031,7 +3077,7 @@ pub(crate) mod tests {
         let mut first_record_hlc = None;
 
         for i in 0..record_count {
-            let sync_id = format!("break_rec_{}", i);
+            let sync_id = format!("break_rec_{i}");
             current_hlc.increment(); // Increment *before* use for the current record
 
             if i == 0 {
@@ -3042,7 +3088,7 @@ pub(crate) mod tests {
             let local = insert_test_record(
                 &db,
                 &sync_id,
-                &format!("Local_{}", i),
+                &format!("Local_{i}"),
                 Some(i as i32),
                 &current_hlc, // Use the incremented HLC
                 &current_hlc, // Use the incremented HLC
@@ -3054,12 +3100,12 @@ pub(crate) mod tests {
             let remote = Model {
                 id: 1000 + i as i32, // Mock PK
                 sync_id: sync_id.clone(),
-                name: format!("Remote_{}", i),
+                name: format!("Remote_{i}"),
                 value: Some(i as i32 * 10),
-                created_at_hlc_ts: current_hlc.to_rfc3339(),
+                created_at_hlc_ts: current_hlc.to_rfc3339()?,
                 created_at_hlc_ct: current_hlc.version as i32,
                 created_at_hlc_id: current_hlc.node_id,
-                updated_at_hlc_ts: current_hlc.to_rfc3339(),
+                updated_at_hlc_ts: current_hlc.to_rfc3339()?,
                 updated_at_hlc_ct: current_hlc.version as i32,
                 updated_at_hlc_id: current_hlc.node_id,
             };
@@ -3186,7 +3232,7 @@ pub(crate) mod tests {
                     assert!(model.sync_id.starts_with("break_rec_"));
                     assert!(model.name.starts_with("Local_")); // Local data pushed
                 }
-                op => panic!("Expected UpdateRemote, got {:?}", op),
+                op => panic!("Expected UpdateRemote, got {op:?}"),
             }
         }
 
@@ -3218,10 +3264,10 @@ pub(crate) mod tests {
             sync_id: "mis_r1".to_string(),
             name: "R1".to_string(),
             value: Some(3),
-            created_at_hlc_ts: hlc3.to_rfc3339(),
+            created_at_hlc_ts: hlc3.to_rfc3339()?,
             created_at_hlc_ct: hlc3.version as i32,
             created_at_hlc_id: hlc3.node_id,
-            updated_at_hlc_ts: hlc3.to_rfc3339(),
+            updated_at_hlc_ts: hlc3.to_rfc3339()?,
             updated_at_hlc_ct: hlc3.version as i32,
             updated_at_hlc_id: hlc3.node_id,
         };
@@ -3230,10 +3276,10 @@ pub(crate) mod tests {
             sync_id: "mis_r2".to_string(),
             name: "R2".to_string(),
             value: Some(4),
-            created_at_hlc_ts: hlc4.to_rfc3339(),
+            created_at_hlc_ts: hlc4.to_rfc3339()?,
             created_at_hlc_ct: hlc4.version as i32,
             created_at_hlc_id: hlc4.node_id,
-            updated_at_hlc_ts: hlc4.to_rfc3339(),
+            updated_at_hlc_ts: hlc4.to_rfc3339()?,
             updated_at_hlc_ct: hlc4.version as i32,
             updated_at_hlc_id: hlc4.node_id,
         };
@@ -3377,10 +3423,10 @@ pub(crate) mod tests {
             sync_id: "pull_new".to_string(),
             name: "RemoteNew".to_string(),
             value: Some(2),
-            created_at_hlc_ts: hlc_remote_insert.to_rfc3339(),
+            created_at_hlc_ts: hlc_remote_insert.to_rfc3339()?,
             created_at_hlc_ct: hlc_remote_insert.version as i32,
             created_at_hlc_id: hlc_remote_insert.node_id,
-            updated_at_hlc_ts: hlc_remote_insert.to_rfc3339(),
+            updated_at_hlc_ts: hlc_remote_insert.to_rfc3339()?,
             updated_at_hlc_ct: hlc_remote_insert.version as i32,
             updated_at_hlc_id: hlc_remote_insert.node_id,
         };
@@ -3389,10 +3435,10 @@ pub(crate) mod tests {
             sync_id: "pull_rec".to_string(),
             name: "RemoteUpdateWins".to_string(),
             value: Some(3),
-            created_at_hlc_ts: hlc_local_old.to_rfc3339(),
+            created_at_hlc_ts: hlc_local_old.to_rfc3339()?,
             created_at_hlc_ct: hlc_local_old.version as i32,
             created_at_hlc_id: hlc_local_old.node_id,
-            updated_at_hlc_ts: hlc_remote_update.to_rfc3339(),
+            updated_at_hlc_ts: hlc_remote_update.to_rfc3339()?,
             updated_at_hlc_ct: hlc_remote_update.version as i32,
             updated_at_hlc_id: hlc_remote_update.node_id,
         };
@@ -3412,14 +3458,14 @@ pub(crate) mod tests {
             start_hlc: hlc_remote_insert.clone(),
             end_hlc: hlc_remote_insert.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[r_new.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&r_new))?,
             fk_mappings: Default::default(),
         };
         let remote_chunk2 = DataChunk {
             start_hlc: hlc_remote_update.clone(),
             end_hlc: hlc_remote_update.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[r_update.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&r_update))?,
             fk_mappings: Default::default(),
         };
         remote_source
@@ -3517,10 +3563,10 @@ pub(crate) mod tests {
             sync_id: "push_rec".to_string(),
             name: "RemoteOld".to_string(),
             value: Some(99),
-            created_at_hlc_ts: hlc_remote_old.to_rfc3339(),
+            created_at_hlc_ts: hlc_remote_old.to_rfc3339()?,
             created_at_hlc_ct: hlc_remote_old.version as i32,
             created_at_hlc_id: hlc_remote_old.node_id,
-            updated_at_hlc_ts: hlc_remote_old.to_rfc3339(),
+            updated_at_hlc_ts: hlc_remote_old.to_rfc3339()?,
             updated_at_hlc_ct: hlc_remote_old.version as i32,
             updated_at_hlc_id: hlc_remote_old.node_id,
         };
@@ -3540,7 +3586,7 @@ pub(crate) mod tests {
             start_hlc: hlc_remote_old.clone(),
             end_hlc: hlc_remote_old.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[r_old.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&r_old))?,
             fk_mappings: Default::default(),
         };
         remote_source
@@ -3650,13 +3696,15 @@ pub(crate) mod tests {
         assert!(result.is_err());
         let error = result.err().unwrap(); // Get the anyhow::Error
         let error_string = error.to_string();
-        eprintln!("Actual error string (get_remote_chunks): {}", error_string);
+        eprintln!("Actual error string (get_remote_chunks): {error_string}");
 
         assert!(error_string.contains("Failed to fetch remote chunks for table 'test_items'"));
-        assert!(error
-            .root_cause()
-            .to_string()
-            .contains("Simulated failure getting remote chunks"));
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("Simulated failure getting remote chunks")
+        );
 
         Ok(())
     }
@@ -3680,10 +3728,10 @@ pub(crate) mod tests {
             sync_id: "fail_rec".to_string(),
             name: "Remote".to_string(),
             value: Some(2),
-            created_at_hlc_ts: data_hlc.to_rfc3339(),
+            created_at_hlc_ts: data_hlc.to_rfc3339()?,
             created_at_hlc_ct: data_hlc.version as i32,
             created_at_hlc_id: data_hlc.node_id,
-            updated_at_hlc_ts: data_hlc.to_rfc3339(),
+            updated_at_hlc_ts: data_hlc.to_rfc3339()?,
             updated_at_hlc_ct: data_hlc.version as i32,
             updated_at_hlc_id: data_hlc.node_id,
         };
@@ -3752,12 +3800,14 @@ pub(crate) mod tests {
         assert!(result.is_err());
         let error = result.err().unwrap();
         let error_string = error.to_string();
-        eprintln!("Actual error string (get_remote_records): {}", error_string);
+        eprintln!("Actual error string (get_remote_records): {error_string}");
         assert!(error_string.contains("Failed to fetch remote records for range"));
-        assert!(error
-            .root_cause()
-            .to_string()
-            .contains("Simulated failure getting remote records"));
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("Simulated failure getting remote records")
+        );
 
         Ok(())
     }
@@ -3823,17 +3873,16 @@ pub(crate) mod tests {
         assert!(result.is_err());
         let error = result.err().unwrap();
         let error_string = error.to_string();
-        eprintln!(
-            "Actual error string (apply_remote_changes): {}",
-            error_string
-        );
+        eprintln!("Actual error string (apply_remote_changes): {error_string}");
         assert!(
             error_string.contains("Sync failed for table 'test_items' during changes application") // Check context
         );
-        assert!(error
-            .root_cause()
-            .to_string()
-            .contains("Simulated remote apply failure")); // Check root cause
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("Simulated remote apply failure")
+        ); // Check root cause
 
         Ok(())
     }
@@ -3862,7 +3911,7 @@ pub(crate) mod tests {
         use std::collections::HashMap;
         use std::str::FromStr;
 
-        use anyhow::{anyhow, Result};
+        use anyhow::{Result, anyhow};
         use async_trait::async_trait;
         use sea_orm::entity::prelude::*;
         use sea_orm::{
@@ -3876,7 +3925,7 @@ pub(crate) mod tests {
         use crate::foreign_key::{
             ActiveModelWithForeignKeyOps, DatabaseExecutor, FkPayload, ModelWithForeignKeyOps,
         };
-        use crate::hlc::{HLCModel, HLCRecord, HLC};
+        use crate::hlc::{HLC, HLCModel, HLCRecord};
 
         #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
         #[sea_orm(table_name = "authors")]
@@ -4030,8 +4079,7 @@ pub(crate) mod tests {
             fn read_key(s: &str) -> Result<<Self as PrimaryKeyTrait>::ValueType> {
                 s.parse::<i32>().map_err(|e| {
                     anyhow!(e).context(format!(
-                        "Failed to parse primary key string '{}' as i32 for Author",
-                        s
+                        "Failed to parse primary key string '{s}' as i32 for Author"
                     ))
                 })
             }
@@ -4044,7 +4092,7 @@ pub(crate) mod tests {
         use std::println as warn;
         use std::str::FromStr;
 
-        use anyhow::{anyhow, Context, Result};
+        use anyhow::{Context, Result, anyhow};
         use async_trait::async_trait;
         use sea_orm::entity::prelude::*;
         use sea_orm::{
@@ -4058,7 +4106,7 @@ pub(crate) mod tests {
         use crate::foreign_key::{
             ActiveModelWithForeignKeyOps, DatabaseExecutor, FkPayload, ModelWithForeignKeyOps,
         };
-        use crate::hlc::{HLCModel, HLCRecord, HLC};
+        use crate::hlc::{HLC, HLCModel, HLCRecord};
 
         #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
         #[sea_orm(table_name = "posts")]
@@ -4165,7 +4213,6 @@ pub(crate) mod tests {
                 db: &E,
             ) -> Result<FkPayload> {
                 let mut payload = FkPayload::new();
-                // Assuming author_id is non-nullable. If it can be null, handle Option<i32> and insert None for payload.
                 if let Some(author) = super::author_entity::Entity::find_by_id(self.author_id)
                     .one(db)
                     .await
@@ -4220,8 +4267,7 @@ pub(crate) mod tests {
                     } else {
                         warn!(
                             "generate_fk_mappings_for_records (Post): Author with local PK {} not found for post with sync_id {}.",
-                            post_model.author_id,
-                            post_model.sync_id
+                            post_model.author_id, post_model.sync_id
                         );
                         // Decide if this is an error or if None should be stored. For now, just warn and skip.
                     }
@@ -4259,8 +4305,7 @@ pub(crate) mod tests {
                             .await
                             .with_context(|| {
                                 format!(
-                                    "Failed to find author by sync_id {} for remapping FK",
-                                    author_sync_id
+                                    "Failed to find author by sync_id {author_sync_id} for remapping FK"
                                 )
                             })?
                         {
@@ -4308,8 +4353,7 @@ pub(crate) mod tests {
             fn read_key(s: &str) -> Result<<Self as PrimaryKeyTrait>::ValueType> {
                 s.parse::<i32>().map_err(|e| {
                     anyhow!(e).context(format!(
-                        "Failed to parse primary key string '{}' as i32 for Post",
-                        s
+                        "Failed to parse primary key string '{s}' as i32 for Post"
                     ))
                 })
             }
@@ -4327,10 +4371,10 @@ pub(crate) mod tests {
             id: NotSet,
             sync_id: Set(sync_id.to_string()),
             name: Set(name.to_string()),
-            created_at_hlc_ts: Set(created_hlc.to_rfc3339()),
+            created_at_hlc_ts: Set(created_hlc.to_rfc3339()?),
             created_at_hlc_ct: Set(created_hlc.version as i32),
             created_at_hlc_id: Set(created_hlc.node_id),
-            updated_at_hlc_ts: Set(updated_hlc.to_rfc3339()),
+            updated_at_hlc_ts: Set(updated_hlc.to_rfc3339()?),
             updated_at_hlc_ct: Set(updated_hlc.version as i32),
             updated_at_hlc_id: Set(updated_hlc.node_id),
         };
@@ -4353,10 +4397,10 @@ pub(crate) mod tests {
             title: Set(title.to_string()),
             author_id: Set(author_id_val),
             remote_author_sync_id: Set(None), // Not stored in DB, set explicitly if needed for test construction
-            created_at_hlc_ts: Set(created_hlc.to_rfc3339()),
+            created_at_hlc_ts: Set(created_hlc.to_rfc3339()?),
             created_at_hlc_ct: Set(created_hlc.version as i32),
             created_at_hlc_id: Set(created_hlc.node_id),
-            updated_at_hlc_ts: Set(updated_hlc.to_rfc3339()),
+            updated_at_hlc_ts: Set(updated_hlc.to_rfc3339()?),
             updated_at_hlc_ct: Set(updated_hlc.version as i32),
             updated_at_hlc_id: Set(updated_hlc.node_id),
         };
@@ -4450,10 +4494,10 @@ pub(crate) mod tests {
             id: 101, // Mock remote PK
             sync_id: "author_sync_1".to_string(),
             name: "Local Author 1".to_string(), // Same name
-            created_at_hlc_ts: hlc_author_v1.to_rfc3339(),
+            created_at_hlc_ts: hlc_author_v1.to_rfc3339()?,
             created_at_hlc_ct: hlc_author_v1.version as i32,
             created_at_hlc_id: hlc_author_v1.node_id,
-            updated_at_hlc_ts: hlc_author_v1.to_rfc3339(),
+            updated_at_hlc_ts: hlc_author_v1.to_rfc3339()?,
             updated_at_hlc_ct: hlc_author_v1.version as i32,
             updated_at_hlc_id: hlc_author_v1.node_id,
         };
@@ -4465,7 +4509,7 @@ pub(crate) mod tests {
             start_hlc: hlc_author_v1.clone(),
             end_hlc: hlc_author_v1.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[remote_author1_model.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_author1_model))?,
             fk_mappings: Default::default(), // Authors don't have FKs in this model
         };
         remote_source
@@ -4478,10 +4522,10 @@ pub(crate) mod tests {
             title: "Remote Post 1".to_string(),
             author_id: remote_author1_model.id, // Remote's local FK to its author_sync_1
             remote_author_sync_id: Some(remote_author1_model.sync_id.clone()), // Critical for resolver
-            created_at_hlc_ts: hlc_post_v1_remote.to_rfc3339(),
+            created_at_hlc_ts: hlc_post_v1_remote.to_rfc3339()?,
             created_at_hlc_ct: hlc_post_v1_remote.version as i32,
             created_at_hlc_id: hlc_post_v1_remote.node_id,
-            updated_at_hlc_ts: hlc_post_v1_remote.to_rfc3339(),
+            updated_at_hlc_ts: hlc_post_v1_remote.to_rfc3339()?,
             updated_at_hlc_ct: hlc_post_v1_remote.version as i32,
             updated_at_hlc_id: hlc_post_v1_remote.node_id,
         };
@@ -4501,7 +4545,7 @@ pub(crate) mod tests {
             start_hlc: hlc_post_v1_remote.clone(),
             end_hlc: hlc_post_v1_remote.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[remote_post1_model.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_post1_model))?,
             fk_mappings: Some(post_fk_mappings),
         };
         remote_source
@@ -4613,10 +4657,10 @@ pub(crate) mod tests {
             id: 101,
             sync_id: "author_sync_1".to_string(),
             name: "Local Author 1".to_string(),
-            created_at_hlc_ts: hlc_author_v1.to_rfc3339(),
+            created_at_hlc_ts: hlc_author_v1.to_rfc3339()?,
             created_at_hlc_ct: hlc_author_v1.version as i32,
             created_at_hlc_id: hlc_author_v1.node_id,
-            updated_at_hlc_ts: hlc_author_v1.to_rfc3339(),
+            updated_at_hlc_ts: hlc_author_v1.to_rfc3339()?,
             updated_at_hlc_ct: hlc_author_v1.version as i32,
             updated_at_hlc_id: hlc_author_v1.node_id,
         };
@@ -4627,7 +4671,7 @@ pub(crate) mod tests {
             start_hlc: hlc_author_v1.clone(),
             end_hlc: hlc_author_v1.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[remote_author1_model.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_author1_model))?,
             fk_mappings: Default::default(), // Authors don't have FKs
         };
         remote_source
@@ -4767,23 +4811,23 @@ pub(crate) mod tests {
                                    hlc_val: &HLC,
                                    name_prefix: &str,
                                    id_val: i32|
-         -> author_entity::Model {
-            author_entity::Model {
+         -> Result<author_entity::Model> {
+            Ok(author_entity::Model {
                 id: id_val,
                 sync_id: sync_id.to_string(),
                 name: format!("{} {}", name_prefix, sync_id.chars().last().unwrap()),
-                created_at_hlc_ts: hlc_val.to_rfc3339(),
+                created_at_hlc_ts: hlc_val.to_rfc3339()?,
                 created_at_hlc_ct: hlc_val.version as i32,
                 created_at_hlc_id: hlc_val.node_id,
-                updated_at_hlc_ts: hlc_val.to_rfc3339(),
+                updated_at_hlc_ts: hlc_val.to_rfc3339()?,
                 updated_at_hlc_ct: hlc_val.version as i32,
                 updated_at_hlc_id: hlc_val.node_id,
-            }
+            })
         };
         let remote_author1_model =
-            common_author_setup("author_sync_1", &hlc_author1_v1, "Remote Author", 101);
+            common_author_setup("author_sync_1", &hlc_author1_v1, "Remote Author", 101)?;
         let remote_author2_model =
-            common_author_setup("author_sync_2", &hlc_author2_v1, "Remote Author", 102);
+            common_author_setup("author_sync_2", &hlc_author2_v1, "Remote Author", 102)?;
         remote_source
             .set_remote_data_for_table(
                 "authors",
@@ -4796,14 +4840,14 @@ pub(crate) mod tests {
                 start_hlc: hlc_author1_v1.clone(),
                 end_hlc: hlc_author1_v1.clone(),
                 count: 1,
-                chunk_hash: calculate_chunk_hash(&[remote_author1_model.clone()])?,
+                chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_author1_model))?,
                 fk_mappings: Default::default(),
             },
             DataChunk {
                 start_hlc: hlc_author2_v1.clone(),
                 end_hlc: hlc_author2_v1.clone(),
                 count: 1,
-                chunk_hash: calculate_chunk_hash(&[remote_author2_model.clone()])?,
+                chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_author2_model))?,
                 fk_mappings: Default::default(),
             },
         ];
@@ -4817,10 +4861,10 @@ pub(crate) mod tests {
             title: "New Title Reparented".to_string(),
             author_id: remote_author2_model.id, // Remote's local FK to its author_sync_2
             remote_author_sync_id: Some(remote_author2_model.sync_id.clone()), // CRITICAL: points to Author 2
-            created_at_hlc_ts: hlc_post_v1_local.to_rfc3339(),
+            created_at_hlc_ts: hlc_post_v1_local.to_rfc3339()?,
             created_at_hlc_ct: hlc_post_v1_local.version as i32,
             created_at_hlc_id: hlc_post_v1_local.node_id,
-            updated_at_hlc_ts: hlc_post_v1_remote_reparented.to_rfc3339(),
+            updated_at_hlc_ts: hlc_post_v1_remote_reparented.to_rfc3339()?,
             updated_at_hlc_ct: hlc_post_v1_remote_reparented.version as i32,
             updated_at_hlc_id: hlc_post_v1_remote_reparented.node_id,
         };
@@ -4840,7 +4884,7 @@ pub(crate) mod tests {
             start_hlc: hlc_post_v1_remote_reparented.clone(),
             end_hlc: hlc_post_v1_remote_reparented.clone(),
             count: 1,
-            chunk_hash: calculate_chunk_hash(&[remote_post1_reparented_model.clone()])?,
+            chunk_hash: calculate_chunk_hash(std::slice::from_ref(&remote_post1_reparented_model))?,
             fk_mappings: Some(post_fk_mappings),
         };
         remote_source

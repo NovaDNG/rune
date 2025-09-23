@@ -57,6 +57,78 @@
   </screenshots>
 
   <releases>
+    <release version="2.0.0-alpha.8" date="2025-09-02">
+      <description>
+        <p>Bugs</p>
+        <ul>
+          <li>Linux build broken.</li>
+          <li>Android build broken.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.0.0-alpha.7" date="2025-09-02">
+      <description>
+        <p>Bugs</p>
+        <ul>
+          <li>Fix incorrect migration config and data generation for the sync package.</li>
+          <li>Downgrade build runner to use Ubuntu 22.04 by @abc1763613206 in
+            https://github.com/Losses/rune/pull/277.</li>
+        </ul>
+        <p>Features</p>
+        <ul>
+          <li>Upgrade flutter to 3.35.</li>
+        </ul>
+        <p>Security</p>
+        <ul>
+          <li>Bump macOS deployment target to 10.15 by @laosb in
+            https://github.com/Losses/rune/pull/273.</li>
+          <li>Bump iOS deployment target to 14.0 by @laosb in
+            https://github.com/Losses/rune/pull/274.</li>
+          <li>Bump tracing-subscriber from 0.3.19 to 0.3.20 by @dependabot[bot] in
+            https://github.com/Losses/rune/pull/275.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.0.0-alpha.6" date="2025-08-20">
+      <description>
+        <p>Bugs</p>
+        <ul>
+          <li>Fix the iOS publishing CI.</li>
+          <li>Fixed the Android CI.</li>
+        </ul>
+        <p>Features</p>
+        <ul>
+          <li>Implemented the Android TF Card file reading support.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.0.0-alpha.5" date="2025-08-10">
+      <description>
+        <p>Bugs</p>
+        <ul>
+          <li>Using zbus for mpris backend by @baiyuanneko in
+            https://github.com/Losses/rune/pull/268.</li>
+        </ul>
+        <p>Features</p>
+        <ul>
+          <li>For macOS, replace with opaque tinted icon by @laosb in
+            https://github.com/Losses/rune/pull/259.</li>
+          <li>Implement the database sync protocol.</li>
+          <li>Improve the performance while users are not interacting with the program.</li>
+          <li>Update Japanese Translation by @NovaDNG in https://github.com/Losses/rune/pull/267.</li>
+          <li>Update Chinese Translation.</li>
+        </ul>
+        <p>Security</p>
+        <ul>
+          <li>Bump openssl from 0.10.70 to 0.10.72 by @dependabot[bot] in
+            https://github.com/Losses/rune/pull/262.</li>
+          <li>Bump tokio from 1.44.1 to 1.44.2 by @dependabot[bot] in
+            https://github.com/Losses/rune/pull/263.</li>
+          <li>Bump crossbeam-channel from 0.5.13 to 0.5.15 by @dependabot[bot] in
+            https://github.com/Losses/rune/pull/264.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.0.0-alpha.4" date="2025-03-19">
       <description>
         <p>Bugs</p>
@@ -75,7 +147,8 @@
         <p>Bugs</p>
         <ul>
           <li>Return operation does not close Context Menu.</li>
-          <li>Clicking the Cover Art next to the playback progress bar does not open the Cover Art Wall.</li>
+          <li>Clicking the Cover Art next to the playback progress bar does not open the Cover Art
+            Wall.</li>
           <li>Event listeners are not destroyed after the FFT visualization component is destroyed.</li>
           <li>The background color tinting feature of the Cover Art Wall is not working properly.</li>
           <li>Android version cannot be compiled normally.</li>

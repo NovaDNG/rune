@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use colored::Colorize;
 
 use hub::messages::*;
@@ -193,14 +193,14 @@ impl VirtualFS {
                         }
 
                         // Now try to find the file in the cache
-                        if let Some(parent_cache) = self.cache.get(&parent_path) {
-                            if let Some(file_entry) =
+                        if let Some(parent_cache) = self.cache.get(&parent_path)
+                            && let Some(file_entry) =
                                 parent_cache.entries.iter().find(|e| e.id == Some(id))
-                            {
-                                current = current.join(&file_entry.name);
-                                continue;
-                            }
+                        {
+                            current = current.join(&file_entry.name);
+                            continue;
                         }
+
                         return Err(anyhow!("File ID {} not found in parent directory", id));
                     }
 
@@ -271,13 +271,14 @@ impl VirtualFS {
                         // Find the track in the cache
                         if let Some(track) =
                             cache_entry.entries.iter().find(|e| e.name == file_name)
+                            && let Some(file_id) = track.id
                         {
-                            if let Some(file_id) = track.id {
-                                return Ok(vec![("lib::track".to_string(), file_id.to_string())]);
-                            }
+                            return Ok(vec![("lib::track".to_string(), file_id.to_string())]);
                         }
+
                         return Err(anyhow!("Track not found in cache"));
                     }
+
                     return Err(anyhow!("Tracks directory not cached"));
                 }
 
@@ -395,7 +396,7 @@ impl VirtualFS {
                     let group_title = self
                         .current_path
                         .components()
-                        .last()
+                        .next_back()
                         .unwrap()
                         .as_os_str()
                         .to_str()
@@ -437,10 +438,10 @@ impl VirtualFS {
             }
         };
 
-        if let Some(collection_type) = path_to_collection_type(&self.current_path) {
-            if let Ok(ref entries) = entries {
-                self.cache_entries(self.current_path.clone(), entries.clone(), collection_type);
-            }
+        if let Some(collection_type) = path_to_collection_type(&self.current_path)
+            && let Ok(ref entries) = entries
+        {
+            self.cache_entries(self.current_path.clone(), entries.clone(), collection_type);
         }
 
         entries
@@ -485,7 +486,7 @@ impl VirtualFS {
             2 => Ok(self.root_dirs.contains(
                 &new_path
                     .components()
-                    .last()
+                    .next_back()
                     .unwrap()
                     .as_os_str()
                     .to_string_lossy()
@@ -502,7 +503,7 @@ impl VirtualFS {
                     .ok_or_else(|| anyhow!("Invalid collection type"))?;
                 let group_name = new_path
                     .components()
-                    .last()
+                    .next_back()
                     .unwrap()
                     .as_os_str()
                     .to_str()
@@ -522,7 +523,7 @@ impl VirtualFS {
                     .ok_or_else(|| anyhow!("Invalid group name"))?;
                 let collection_name = new_path
                     .components()
-                    .last()
+                    .next_back()
                     .unwrap()
                     .as_os_str()
                     .to_str()
@@ -552,6 +553,7 @@ impl AsStr for CollectionType {
             CollectionType::Mix => "Mix",
             CollectionType::Track => "Track",
             CollectionType::Genre => "Genre",
+            CollectionType::Directory => "Directory",
         }
     }
 }

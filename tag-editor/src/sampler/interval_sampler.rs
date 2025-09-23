@@ -1,15 +1,18 @@
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rubato::{FftFixedInOut, Resampler};
-use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
-use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
-use symphonia::core::conv::IntoSample;
-use symphonia::core::formats::FormatReader;
-use symphonia::core::sample::Sample;
+use symphonia::core::{
+    audio::{AudioBuffer, AudioBufferRef, Signal},
+    codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions},
+    conv::IntoSample,
+    formats::FormatReader,
+    sample::Sample,
+};
 use tokio_util::sync::CancellationToken;
 
 use analysis::utils::audio_metadata_reader::{get_codec_information, get_format};
+use fsio::FsIo;
 
 pub struct SampleEvent {
     pub sample_index: usize,  // The index of the current sample
@@ -66,7 +69,8 @@ impl IntervalSampler {
 
             fn_is_cancelled: Box::new(move || {
                 cancel_token
-                    .as_ref().is_some_and(|token| token.is_cancelled())
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
             }),
             is_cancelled: false,
 
@@ -76,9 +80,9 @@ impl IntervalSampler {
     }
 
     // Main processing function to read and process audi
-    pub fn process(&mut self) -> Result<()> {
+    pub fn process(&mut self, fsio: &FsIo) -> Result<()> {
         // Get the audio format from the file path
-        let mut format = get_format(&self.file_path)?;
+        let mut format = get_format(fsio, &self.file_path)?;
 
         // Find a valid audio track
         let track = match format

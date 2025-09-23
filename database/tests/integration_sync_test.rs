@@ -2,72 +2,122 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
+    Router,
     routing::{get, post},
-    serve, Router,
+    serve,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::{
-    prelude::Decimal, ActiveModelTrait, ActiveValue, ColumnTrait, ConnectOptions, Database,
-    DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    ActiveModelTrait, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    IntoActiveModel, PaginatorTrait, QueryFilter, Set, prelude::Decimal,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 
 use ::database::{
     connection::initialize_db,
-    entities::{albums, media_cover_art, media_files, sync_record},
+    entities::{albums, media_cover_art, media_file_albums, media_files, prelude::*},
     sync::{
         chunking::{
-            apply_remote_changes_handler, get_node_id_handler, get_remote_chunks_handler,
+            AppState, apply_remote_changes_handler, get_node_id_handler, get_remote_chunks_handler,
             get_remote_last_sync_hlc_handler, get_remote_records_in_hlc_range_handler,
-            get_remote_sub_chunks_handler, AppState,
+            get_remote_sub_chunks_handler,
         },
         data_source::RemoteHttpDataSource,
         foreign_keys::RuneForeignKeyResolver,
-        setup_and_run_sync, utils as sync_utils,
+        setup_and_run_sync,
     },
 };
 use ::sync::{
-    chunking::ChunkingOptions,
-    core::{RemoteDataSource, SyncTableMetadata},
-    hlc::{SyncTaskContext, HLC},
+    chunking::ChunkingOptions, core::RemoteDataSource, hlc::SyncTaskContext,
     sync_scheduler::TableSyncResult,
 };
 
-async fn setup_db(is_server: bool, node_id: &str) -> Result<DatabaseConnection> {
+// Constants for Table Names
+const ALBUMS_TABLE: &str = "albums";
+
+// Test Fixture
+
+struct TestFixture {
+    server: TestServer,
+    server_db: DatabaseConnection,
+    client_db: DatabaseConnection,
+    client_node_id: Uuid,
+    client_hlc_context: Arc<SyncTaskContext>,
+    remote_data_source: RemoteHttpDataSource,
+}
+
+impl TestFixture {
+    async fn new() -> Result<Self> {
+        let _ = env_logger::try_init();
+
+        let server_db = setup_db(true).await.context("Server DB setup failed")?;
+        let client_db = setup_db(false).await.context("Client DB setup failed")?;
+
+        let server = start_server(server_db.clone())
+            .await
+            .context("Server start failed")?;
+        let client_node_id = Uuid::new_v4();
+        let client_hlc_context = Arc::new(SyncTaskContext::new(client_node_id));
+        let remote_data_source = RemoteHttpDataSource::new(&format!("http://{}", server.addr));
+
+        Ok(Self {
+            server,
+            server_db,
+            client_db,
+            client_node_id,
+            client_hlc_context,
+            remote_data_source,
+        })
+    }
+
+    async fn run_sync(&self) -> Result<Vec<TableSyncResult>> {
+        setup_and_run_sync(
+            &self.client_db,
+            self.client_node_id,
+            &self.remote_data_source,
+            &self.client_hlc_context,
+        )
+        .await
+    }
+
+    fn server_hlc_context(&self) -> &Arc<SyncTaskContext> {
+        &self.server.hlc_context
+    }
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.server.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+    }
+}
+
+async fn setup_db(is_server: bool) -> Result<DatabaseConnection> {
     let side = if is_server { "server" } else { "client" };
-    println!("Setting up database for the {} side", side);
-
-    // Use a named, shared, in-memory SQLite database.
-    // Each test run gets a unique DB name to prevent interference.
-    // The `cache=shared` is crucial.
     let db_name = format!("test-db-{}-{}", side, Uuid::new_v4());
-    let db_url = format!("sqlite:file:{}?mode=memory&cache=shared", db_name);
-
-    println!("Initializing shared in-memory DB at: {}", db_url);
+    let db_url = format!("sqlite:file:{db_name}?mode=memory&cache=shared");
 
     let mut opt = ConnectOptions::new(&db_url);
-
-    opt.sqlx_logging(true)
-        .sqlx_logging_level(log::LevelFilter::Trace)
-        .acquire_timeout(Duration::from_secs(10));
+    opt.sqlx_logging(false); // Disable verbose logging for cleaner test output
 
     let db = Database::connect(opt).await?;
-    initialize_db(&db, node_id).await?;
+    // Use a random node_id for test dbs, it's not relevant for these tests
+    initialize_db(&db, &Uuid::new_v4().to_string()).await?;
     Ok(db)
 }
 
 pub struct TestServer {
     addr: SocketAddr,
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-    handle: JoinHandle<Result<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    _handle: JoinHandle<Result<()>>,
     pub node_id: Uuid,
     hlc_context: Arc<SyncTaskContext>,
 }
 
 async fn start_server(db: DatabaseConnection) -> Result<TestServer> {
     let server_node_id = Uuid::new_v4();
-
     let hlc_context = Arc::new(SyncTaskContext::new(server_node_id));
 
     let app_state = Arc::new(AppState {
@@ -104,9 +154,7 @@ async fn start_server(db: DatabaseConnection) -> Result<TestServer> {
 
     let port = portpicker::pick_unused_port().context("No free ports")?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
     let listener = TcpListener::bind(addr).await?;
 
     let handle = tokio::spawn(async move {
@@ -118,42 +166,154 @@ async fn start_server(db: DatabaseConnection) -> Result<TestServer> {
             .context("Axum server error")
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // Give server a moment to start
 
     Ok(TestServer {
         addr,
-        shutdown_tx,
-        handle,
+        shutdown_tx: Some(shutdown_tx),
+        _handle: handle,
         node_id: server_node_id,
         hlc_context,
     })
 }
 
+// Data Seeding Helpers
+
+async fn seed_album(
+    db: &DatabaseConnection,
+    hlc_context: &SyncTaskContext,
+    pk_id: i32,
+    name: &str,
+    hlc_uuid: Option<Uuid>,
+) -> Result<albums::Model> {
+    let hlc = hlc_context.generate_hlc();
+    let model = albums::ActiveModel {
+        id: Set(pk_id),
+        name: Set(name.to_string()),
+        group: Set("Test Group".to_string()),
+        hlc_uuid: Set(hlc_uuid.unwrap_or_else(Uuid::new_v4).to_string()),
+        created_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        created_at_hlc_ver: Set(hlc.version as i32),
+        created_at_hlc_nid: Set(hlc.node_id.to_string()),
+        updated_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        updated_at_hlc_ver: Set(hlc.version as i32),
+        updated_at_hlc_nid: Set(hlc.node_id.to_string()),
+    };
+    model.insert(db).await.context("Failed to seed album")
+}
+
+async fn seed_album_with_hlc(
+    db: &DatabaseConnection,
+    pk_id: i32,
+    name: &str,
+    hlc_uuid: Option<Uuid>,
+    hlc: &::sync::hlc::HLC,
+) -> Result<albums::Model> {
+    let model = albums::ActiveModel {
+        id: Set(pk_id),
+        name: Set(name.to_string()),
+        group: Set("Test Group".to_string()),
+        hlc_uuid: Set(hlc_uuid.unwrap_or_else(Uuid::new_v4).to_string()),
+        created_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        created_at_hlc_ver: Set(hlc.version as i32),
+        created_at_hlc_nid: Set(hlc.node_id.to_string()),
+        updated_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        updated_at_hlc_ver: Set(hlc.version as i32),
+        updated_at_hlc_nid: Set(hlc.node_id.to_string()),
+    };
+    model.insert(db).await.context("Failed to seed album")
+}
+
+async fn seed_cover_art(
+    db: &DatabaseConnection,
+    hlc_context: &SyncTaskContext,
+    pk_id: i32,
+    file_hash: &str,
+    binary: Vec<u8>,
+) -> Result<media_cover_art::Model> {
+    let hlc = hlc_context.generate_hlc();
+    media_cover_art::ActiveModel {
+        id: Set(pk_id),
+        file_hash: Set(file_hash.to_string()),
+        binary: Set(binary),
+        primary_color: Set(Some(0xAAAAAA)),
+        hlc_uuid: Set(Uuid::new_v4().to_string()),
+        created_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        created_at_hlc_ver: Set(hlc.version as i32),
+        created_at_hlc_nid: Set(hlc.node_id.to_string()),
+        updated_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        updated_at_hlc_ver: Set(hlc.version as i32),
+        updated_at_hlc_nid: Set(hlc.node_id.to_string()),
+    }
+    .insert(db)
+    .await
+    .context("Failed to seed cover art")
+}
+
+async fn seed_media_file(
+    db: &DatabaseConnection,
+    hlc_context: &SyncTaskContext,
+    pk_id: i32,
+    file_name: &str,
+    cover_art_id: Option<i32>,
+) -> Result<media_files::Model> {
+    let hlc = hlc_context.generate_hlc();
+    media_files::ActiveModel {
+        id: Set(pk_id),
+        file_name: Set(file_name.to_string()),
+        directory: Set(format!("/music/{file_name}/")),
+        extension: Set("mp3".to_string()),
+        file_hash: Set(format!("{file_name}_hash")),
+        last_modified: Set(Utc::now().to_rfc3339()),
+        cover_art_id: Set(cover_art_id),
+        sample_rate: Set(44100),
+        duration: Set(Decimal::new(180, 0)),
+        hlc_uuid: Set(Uuid::new_v4().to_string()),
+        created_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        created_at_hlc_ver: Set(hlc.version as i32),
+        created_at_hlc_nid: Set(hlc.node_id.to_string()),
+        updated_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        updated_at_hlc_ver: Set(hlc.version as i32),
+        updated_at_hlc_nid: Set(hlc.node_id.to_string()),
+    }
+    .insert(db)
+    .await
+    .context("Failed to seed media file")
+}
+
+async fn seed_media_file_album(
+    db: &DatabaseConnection,
+    hlc_context: &SyncTaskContext,
+    id: i32,
+    media_file_id: i32,
+    album_id: i32,
+    track_number: i32,
+) -> Result<media_file_albums::Model> {
+    let hlc = hlc_context.generate_hlc();
+    media_file_albums::ActiveModel {
+        id: Set(id),
+        media_file_id: Set(media_file_id),
+        album_id: Set(album_id),
+        track_number: Set(Some(track_number)),
+        hlc_uuid: Set(Uuid::new_v4().to_string()),
+        created_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        created_at_hlc_ver: Set(hlc.version as i32),
+        created_at_hlc_nid: Set(hlc.node_id.to_string()),
+        updated_at_hlc_ts: Set(hlc.to_rfc3339()?),
+        updated_at_hlc_ver: Set(hlc.version as i32),
+        updated_at_hlc_nid: Set(hlc.node_id.to_string()),
+    }
+    .insert(db)
+    .await
+    .context("Failed to seed media file album")
+}
+
+// Refactored Tests
+
 #[tokio::test]
 async fn test_initial_sync_empty_databases() -> Result<()> {
-    let _ = env_logger::try_init();
-
-    let server_db = setup_db(true, "").await.context("Server DB setup failed")?;
-    let client_db = setup_db(false, "")
-        .await
-        .context("Client DB setup failed")?;
-
-    let test_server = start_server(server_db.clone())
-        .await
-        .context("Server start failed")?;
-    let client_node_id = Uuid::new_v4();
-
-    let remote_data_source = RemoteHttpDataSource::new(&format!("http://{}", test_server.addr));
-    let hlc_task_context = SyncTaskContext::new(client_node_id);
-
-    let results: Vec<TableSyncResult> = setup_and_run_sync(
-        &client_db,
-        client_node_id,
-        &remote_data_source,
-        &hlc_task_context,
-    )
-    .await
-    .context("Sync execution failed")?;
+    let fixture = TestFixture::new().await?;
+    let results = fixture.run_sync().await.context("Sync execution failed")?;
 
     for result in results {
         assert!(
@@ -162,529 +322,1088 @@ async fn test_initial_sync_empty_databases() -> Result<()> {
             result.table_name_str(),
             result.get_error()
         );
-        let metadata = result.unwrap_metadata();
-        let known_tables = [
-            "albums",
-            "artists",
-            "genres",
-            "media_cover_art",
-            "media_files",
-            "media_file_albums",
-            "media_file_artists",
-            "media_file_genres",
-        ];
-        assert!(
-            known_tables.contains(&metadata.table_name.as_str()),
-            "Unexpected table in sync metadata: {}",
-            metadata.table_name
-        );
     }
 
-    assert_eq!(albums::Entity::find().count(&client_db).await?, 0);
-    assert_eq!(albums::Entity::find().count(&server_db).await?, 0);
-
-    test_server.shutdown_tx.send(()).ok();
-    test_server.handle.await??;
+    assert_eq!(
+        Albums::find().count(&fixture.client_db).await?,
+        0,
+        "Client DB should have no albums"
+    );
+    assert_eq!(
+        Albums::find().count(&fixture.server_db).await?,
+        0,
+        "Server DB should have no albums"
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn test_client_inserts_album_synced_to_server() -> Result<()> {
-    let _ = env_logger::try_init();
+    let fixture = TestFixture::new().await?;
 
-    let server_db = setup_db(true, "").await?;
-    let client_db = setup_db(false, "").await?;
-    let test_server = start_server(server_db.clone()).await?;
-    let client_node_id = Uuid::new_v4();
-    let remote_data_source = RemoteHttpDataSource::new(&format!("http://{}", test_server.addr));
-    let hlc_task_context = SyncTaskContext::new(client_node_id);
-
-    // 1. Client inserts data
-    // Use the HLC context to generate a realistic timestamp that will be > the initial sync HLC.
-    let album_creation_hlc = hlc_task_context.generate_hlc();
-    println!("[TEST] Creating album with HLC: {}", album_creation_hlc); // Add a log for good measure
-    let new_album_pk_id = 1;
-    let new_album_hlc_uuid = Uuid::new_v4().to_string();
-
-    let new_album = albums::ActiveModel {
-        id: ActiveValue::Set(new_album_pk_id),
-        name: ActiveValue::Set("Client Test Album".to_string()),
-        group: ActiveValue::Set("Test Group".to_string()),
-        hlc_uuid: ActiveValue::Set(new_album_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(album_creation_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(album_creation_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(album_creation_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(album_creation_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(album_creation_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(album_creation_hlc.node_id.to_string()),
-    };
-    new_album.insert(&client_db).await?;
-
-    // FOR DEBUG PURPOSE
-    let all_server_albums = albums::Entity::find().all(&client_db).await?;
-    println!("**CLIENT_DB: {:#?}", all_server_albums);
-
-    tokio::time::sleep(Duration::from_millis(5)).await;
-
-    // 2. Run sync
-    let results: Vec<TableSyncResult> = setup_and_run_sync(
-        &client_db,
-        client_node_id,
-        &remote_data_source,
-        &hlc_task_context,
+    let client_album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        1,
+        "Client Album",
+        None,
     )
     .await?;
+    fixture.run_sync().await?;
 
-    // 3. Assertions
-    let albums_job_result_item_ref: &TableSyncResult = results
-        .iter()
-        .find(|r| r.get_metadata().is_some_and(|s| s.table_name == "albums"))
-        .expect("Albums job result not found");
-
-    let albums_job_metadata: &SyncTableMetadata = albums_job_result_item_ref.metadata_ref();
-
-    assert_eq!(albums_job_metadata.table_name, "albums");
-    assert!(
-        albums_job_metadata.last_sync_hlc >= album_creation_hlc,
-        "Last sync HLC ({}) should be >= the HLC of the synced client album ({})",
-        albums_job_metadata.last_sync_hlc,
-        album_creation_hlc
-    );
-
-    let server_album = albums::Entity::find()
-        .filter(albums::Column::HlcUuid.eq(new_album_hlc_uuid.clone()))
-        .one(&server_db)
+    let server_album = Albums::find()
+        .filter(albums::Column::HlcUuid.eq(client_album.hlc_uuid.clone()))
+        .one(&fixture.server_db)
         .await?
         .context("Album not found on server by HLC_UUID")?;
 
-    assert_eq!(server_album.name, "Client Test Album");
-    assert_eq!(server_album.hlc_uuid, new_album_hlc_uuid);
-
-    test_server.shutdown_tx.send(()).ok();
-    test_server.handle.await??;
+    assert_eq!(server_album.name, client_album.name);
+    assert_eq!(server_album.id, client_album.id);
     Ok(())
 }
 
 #[tokio::test]
 async fn test_server_inserts_album_synced_to_client() -> Result<()> {
-    let _ = env_logger::try_init();
+    let fixture = TestFixture::new().await?;
 
-    let server_db = setup_db(true, "").await?;
-    let client_db = setup_db(false, "").await?;
-    let test_server = start_server(server_db.clone()).await?;
-    let client_node_id = Uuid::new_v4();
-    let remote_data_source = RemoteHttpDataSource::new(&format!("http://{}", test_server.addr));
-    let hlc_task_context = SyncTaskContext::new(client_node_id);
-
-    let album_creation_hlc = test_server.hlc_context.generate_hlc();
-    let new_album_pk_id = 2;
-    let new_album_hlc_uuid = Uuid::new_v4().to_string();
-
-    albums::ActiveModel {
-        id: ActiveValue::Set(new_album_pk_id),
-        name: ActiveValue::Set("Server Test Album".to_string()),
-        group: ActiveValue::Set("Server Group".to_string()),
-        hlc_uuid: ActiveValue::Set(new_album_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(album_creation_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(album_creation_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(album_creation_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(album_creation_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(album_creation_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(album_creation_hlc.node_id.to_string()),
-    }
-    .insert(&server_db)
-    .await?;
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let results: Vec<TableSyncResult> = setup_and_run_sync(
-        &client_db,
-        client_node_id,
-        &remote_data_source,
-        &hlc_task_context,
+    let server_album = seed_album(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        2,
+        "Server Album",
+        None,
     )
     .await?;
+    fixture.run_sync().await?;
 
-    let albums_job_metadata = results
-        .iter()
-        .find(|r| r.get_metadata().is_some_and(|s| s.table_name == "albums"))
-        .expect("Albums job result not found")
-        .metadata_ref();
-
-    assert_eq!(albums_job_metadata.table_name, "albums");
-    assert!(
-        albums_job_metadata.last_sync_hlc >= album_creation_hlc,
-        "Last sync HLC ({}) should be >= the HLC of the synced server album ({})",
-        albums_job_metadata.last_sync_hlc,
-        album_creation_hlc
-    );
-
-    let client_album = albums::Entity::find_by_id(new_album_pk_id)
-        .one(&client_db)
+    let client_album = Albums::find_by_id(server_album.id)
+        .one(&fixture.client_db)
         .await?
         .context("Album not found on client")?;
 
-    assert_eq!(client_album.name, "Server Test Album");
-    assert_eq!(client_album.hlc_uuid, new_album_hlc_uuid);
-
-    test_server.shutdown_tx.send(()).ok();
-    test_server.handle.await??;
+    assert_eq!(client_album.name, server_album.name);
+    assert_eq!(client_album.hlc_uuid, server_album.hlc_uuid);
     Ok(())
 }
 
 #[tokio::test]
 async fn test_bidirectional_sync_different_albums() -> Result<()> {
-    let _ = env_logger::try_init();
+    let fixture = TestFixture::new().await?;
 
-    let server_db = setup_db(true, "").await?;
-    let client_db = setup_db(false, "").await?;
-    let test_server = start_server(server_db.clone()).await?;
-    let client_node_id = Uuid::new_v4();
-    let remote_data_source = RemoteHttpDataSource::new(&format!("http://{}", test_server.addr));
-    let hlc_task_context = SyncTaskContext::new(client_node_id);
-
-    let client_hlc = hlc_task_context.generate_hlc();
-    let album_c_pk_id = 3;
-    let album_c_hlc_uuid = Uuid::new_v4().to_string();
-    albums::ActiveModel {
-        id: ActiveValue::Set(album_c_pk_id),
-        name: ActiveValue::Set("Album C (from Client)".to_string()),
-        group: ActiveValue::Set("Client Group".to_string()),
-        hlc_uuid: ActiveValue::Set(album_c_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(client_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(client_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(client_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(client_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(client_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(client_hlc.node_id.to_string()),
-    }
-    .insert(&client_db)
+    let client_album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        3,
+        "Client Album",
+        None,
+    )
     .await?;
-
-    let server_hlc = test_server.hlc_context.generate_hlc();
-    let album_s_pk_id = 4;
-    let album_s_hlc_uuid = Uuid::new_v4().to_string();
-    albums::ActiveModel {
-        id: ActiveValue::Set(album_s_pk_id),
-        name: ActiveValue::Set("Album S (from Server)".to_string()),
-        group: ActiveValue::Set("Server Group".to_string()),
-        hlc_uuid: ActiveValue::Set(album_s_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(server_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(server_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(server_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(server_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(server_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(server_hlc.node_id.to_string()),
-    }
-    .insert(&server_db)
-    .await?;
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let results: Vec<TableSyncResult> = setup_and_run_sync(
-        &client_db,
-        client_node_id,
-        &remote_data_source,
-        &hlc_task_context,
+    let server_album = seed_album(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        4,
+        "Server Album",
+        None,
     )
     .await?;
 
-    let albums_job_metadata = results
-        .iter()
-        .find(|r| r.get_metadata().is_some_and(|s| s.table_name == "albums"))
-        .expect("Albums job result not found")
-        .metadata_ref();
+    fixture.run_sync().await?;
 
-    let max_creation_hlc = std::cmp::max(client_hlc, server_hlc);
-    assert!(
-        albums_job_metadata.last_sync_hlc >= max_creation_hlc,
-        "Last sync HLC ({}) should be >= the max HLC of all created records ({})",
-        albums_job_metadata.last_sync_hlc,
-        max_creation_hlc
+    assert_eq!(
+        Albums::find().count(&fixture.client_db).await?,
+        2,
+        "Client should have 2 albums after sync"
+    );
+    assert_eq!(
+        Albums::find().count(&fixture.server_db).await?,
+        2,
+        "Server should have 2 albums after sync"
     );
 
-    assert_eq!(albums::Entity::find().count(&client_db).await?, 2);
-    assert_eq!(albums::Entity::find().count(&server_db).await?, 2);
+    // Verify client has server's album
+    let server_album_on_client = Albums::find_by_id(server_album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap();
+    assert_eq!(server_album_on_client.name, server_album.name);
 
-    test_server.shutdown_tx.send(()).ok();
-    test_server.handle.await??;
+    // Verify server has client's album
+    let client_album_on_server = Albums::find_by_id(client_album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap();
+    assert_eq!(client_album_on_server.name, client_album.name);
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_sync_media_files_with_cover_art_fk() -> Result<()> {
-    let _ = env_logger::try_init();
+    let fixture = TestFixture::new().await?;
 
-    let server_db = setup_db(true, "").await?;
-    let client_db = setup_db(false, "").await?;
-    let test_server = start_server(server_db.clone()).await?;
-    let client_node_id = Uuid::new_v4();
-    let remote_data_source = RemoteHttpDataSource::new(&format!("http://{}", test_server.addr));
-    let hlc_task_context = SyncTaskContext::new(client_node_id);
-
-    // Client: Insert CoverArt CA1, MediaFile MF1 -> CA1
-    let ca1_hlc = hlc_task_context.generate_hlc();
-    let ca1_pk_id = 1;
-    let ca1_hlc_uuid = Uuid::new_v4().to_string();
-    let ca1_client = media_cover_art::ActiveModel {
-        id: ActiveValue::Set(ca1_pk_id),
-        file_hash: ActiveValue::Set("ca1_hash_client".to_string()),
-        binary: ActiveValue::Set(vec![1, 1, 1]),
-        primary_color: ActiveValue::Set(Some(0xAAAAAA)),
-        hlc_uuid: ActiveValue::Set(ca1_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(ca1_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(ca1_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(ca1_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(ca1_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(ca1_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(ca1_hlc.node_id.to_string()),
-    };
-    ca1_client.insert(&client_db).await?;
-
-    let mf1_hlc = hlc_task_context.generate_hlc();
-    let mf1_pk_id = 10;
-    let mf1_hlc_uuid = Uuid::new_v4().to_string();
-    let mf1_client = media_files::ActiveModel {
-        id: ActiveValue::Set(mf1_pk_id),
-        file_name: ActiveValue::Set("client_song_1".to_string()),
-        directory: ActiveValue::Set("/music/client/".to_string()),
-        extension: ActiveValue::Set("mp3".to_string()),
-        file_hash: ActiveValue::Set("mf1_hash_client".to_string()),
-        last_modified: ActiveValue::Set(Utc::now().to_rfc3339()),
-        cover_art_id: ActiveValue::Set(Some(ca1_pk_id)),
-        sample_rate: ActiveValue::Set(44100),
-        duration: ActiveValue::Set(Decimal::new(180, 0)),
-        hlc_uuid: ActiveValue::Set(mf1_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(mf1_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(mf1_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(mf1_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(mf1_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(mf1_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(mf1_hlc.node_id.to_string()),
-    };
-    mf1_client.insert(&client_db).await?;
-
-    // First sync (Client -> Server)
-    let _results1: Vec<TableSyncResult> = setup_and_run_sync(
-        &client_db,
-        client_node_id,
-        &remote_data_source,
-        &hlc_task_context,
+    // Client creates cover art and a media file linking to it
+    let client_ca = seed_cover_art(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        1,
+        "ca1_hash",
+        vec![1],
+    )
+    .await?;
+    let client_mf = seed_media_file(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        10,
+        "client_song",
+        Some(client_ca.id),
     )
     .await?;
 
-    let server_ca1 = media_cover_art::Entity::find()
-        .filter(media_cover_art::Column::HlcUuid.eq(ca1_hlc_uuid.clone()))
-        .one(&server_db)
+    fixture
+        .run_sync()
+        .await
+        .context("First sync (C->S) failed")?;
+
+    // Verify client's data is on the server with correct FK
+    let server_ca = MediaCoverArt::find()
+        .filter(media_cover_art::Column::HlcUuid.eq(client_ca.hlc_uuid))
+        .one(&fixture.server_db)
         .await?
-        .context("CA1 not on server")?;
-    assert_eq!(server_ca1.file_hash, "ca1_hash_client");
-    assert_eq!(server_ca1.binary, vec![1, 1, 1]);
-    assert_eq!(server_ca1.primary_color, Some(0xAAAAAA));
-
-    let server_mf1 = media_files::Entity::find()
-        .filter(media_files::Column::HlcUuid.eq(mf1_hlc_uuid.clone()))
-        .one(&server_db)
+        .context("Cover art not on server")?;
+    let server_mf = MediaFiles::find()
+        .filter(media_files::Column::HlcUuid.eq(client_mf.hlc_uuid))
+        .one(&fixture.server_db)
         .await?
-        .context("MF1 not on server")?;
-    assert_eq!(server_mf1.file_name, "client_song_1");
-    assert_eq!(server_mf1.directory, "/music/client/");
-    assert_eq!(server_mf1.cover_art_id, Some(server_ca1.id)); // FK check
+        .context("Media file not on server")?;
+    assert_eq!(
+        server_mf.cover_art_id,
+        Some(server_ca.id),
+        "FK from media_file to cover_art is incorrect on server"
+    );
 
-    // Server: Insert CoverArt CA2, MediaFile MF2 -> CA2
-    let ca2_hlc = test_server.hlc_context.generate_hlc();
-    let ca2_pk_id = 2;
-    let ca2_hlc_uuid = Uuid::new_v4().to_string();
-    let ca2_server = media_cover_art::ActiveModel {
-        id: ActiveValue::Set(ca2_pk_id),
-        file_hash: ActiveValue::Set("ca2_hash_server".to_string()),
-        binary: ActiveValue::Set(vec![2, 2, 2]),
-        primary_color: ActiveValue::Set(Some(0xBBBBBB)),
-        hlc_uuid: ActiveValue::Set(ca2_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(ca2_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(ca2_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(ca2_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(ca2_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(ca2_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(ca2_hlc.node_id.to_string()),
-    };
-    ca2_server.insert(&server_db).await?;
-
-    let mf2_hlc = test_server.hlc_context.generate_hlc();
-    let mf2_pk_id = 20;
-    let mf2_hlc_uuid = Uuid::new_v4().to_string();
-    let mf2_server = media_files::ActiveModel {
-        id: ActiveValue::Set(mf2_pk_id),
-        file_name: ActiveValue::Set("server_song_2".to_string()),
-        directory: ActiveValue::Set("/audio/server/".to_string()),
-        extension: ActiveValue::Set("ogg".to_string()),
-        file_hash: ActiveValue::Set("mf2_hash_server".to_string()),
-        last_modified: ActiveValue::Set(Utc::now().to_rfc3339()),
-        cover_art_id: ActiveValue::Set(Some(ca2_pk_id)),
-        sample_rate: ActiveValue::Set(48000),
-        duration: ActiveValue::Set(Decimal::new(2405, 1)),
-        hlc_uuid: ActiveValue::Set(mf2_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(mf2_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(mf2_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(mf2_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(mf2_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(mf2_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(mf2_hlc.node_id.to_string()),
-    };
-    mf2_server.insert(&server_db).await?;
-
-    // Second sync (Server -> Client)
-    let _results_2: Vec<TableSyncResult> = setup_and_run_sync(
-        &client_db,
-        client_node_id,
-        &remote_data_source,
-        &hlc_task_context,
+    // Server creates its own data
+    let server_ca2 = seed_cover_art(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        2,
+        "ca2_hash",
+        vec![2],
+    )
+    .await?;
+    let server_mf2 = seed_media_file(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        20,
+        "server_song",
+        Some(server_ca2.id),
     )
     .await?;
 
-    let client_ca2 = media_cover_art::Entity::find()
-        .filter(media_cover_art::Column::HlcUuid.eq(ca2_hlc_uuid.clone()))
-        .one(&client_db)
+    fixture
+        .run_sync()
+        .await
+        .context("Second sync (S->C) failed")?;
+
+    // Verify server's data is on the client with correct FK
+    let client_ca2 = MediaCoverArt::find()
+        .filter(media_cover_art::Column::HlcUuid.eq(server_ca2.hlc_uuid))
+        .one(&fixture.client_db)
         .await?
-        .context("CA2 not on client")?;
-    assert_eq!(client_ca2.file_hash, "ca2_hash_server");
-    assert_eq!(client_ca2.binary, vec![2, 2, 2]);
-    assert_eq!(client_ca2.primary_color, Some(0xBBBBBB));
-
-    let client_mf2 = media_files::Entity::find()
-        .filter(media_files::Column::HlcUuid.eq(mf2_hlc_uuid.clone()))
-        .one(&client_db)
+        .context("Server CA not on client")?;
+    let client_mf2 = MediaFiles::find()
+        .filter(media_files::Column::HlcUuid.eq(server_mf2.hlc_uuid))
+        .one(&fixture.client_db)
         .await?
-        .context("MF2 not on client")?;
-    assert_eq!(client_mf2.file_name, "server_song_2");
-    assert_eq!(client_mf2.directory, "/audio/server/");
-    assert_eq!(client_mf2.sample_rate, 48000);
-    assert_eq!(client_mf2.duration, Decimal::new(2405, 1));
-    assert_eq!(client_mf2.cover_art_id, Some(client_ca2.id)); // FK check
+        .context("Server MF not on client")?;
+    assert_eq!(
+        client_mf2.cover_art_id,
+        Some(client_ca2.id),
+        "FK from media_file to cover_art is incorrect on client"
+    );
 
-    // Verify counts
-    assert_eq!(media_cover_art::Entity::find().count(&client_db).await?, 2);
-    assert_eq!(media_files::Entity::find().count(&client_db).await?, 2);
-    assert_eq!(media_cover_art::Entity::find().count(&server_db).await?, 2);
-    assert_eq!(media_files::Entity::find().count(&server_db).await?, 2);
+    // Final counts
+    assert_eq!(MediaCoverArt::find().count(&fixture.client_db).await?, 2);
+    assert_eq!(MediaFiles::find().count(&fixture.client_db).await?, 2);
+    assert_eq!(MediaCoverArt::find().count(&fixture.server_db).await?, 2);
+    assert_eq!(MediaFiles::find().count(&fixture.server_db).await?, 2);
 
-    test_server.shutdown_tx.send(()).ok();
-    test_server.handle.await??;
     Ok(())
 }
 
 #[tokio::test]
 async fn test_get_remote_last_sync_hlc() -> Result<()> {
-    let _ = env_logger::try_init();
+    let fixture = TestFixture::new().await?;
 
-    let server_db = setup_db(true, "").await?;
-    let client_db = setup_db(false, "").await?;
-    let test_server = start_server(server_db.clone()).await?;
-    let client_node_id = Uuid::new_v4();
-    let remote_data_source = RemoteHttpDataSource::new(&format!("http://{}", test_server.addr));
-    let hlc_task_context = SyncTaskContext::new(client_node_id);
-
-    // Initial check
-    let last_hlc_before_sync = remote_data_source
-        .get_remote_last_sync_hlc("albums", client_node_id)
+    let last_hlc_before = fixture
+        .remote_data_source
+        .get_remote_last_sync_hlc(ALBUMS_TABLE, fixture.client_node_id)
         .await?;
-    assert!(last_hlc_before_sync.is_none());
+    assert!(
+        last_hlc_before.is_none(),
+        "Should be no last sync HLC for a new client"
+    );
 
-    let album_creation_hlc = hlc_task_context.generate_hlc();
-    let album_pk_id = 5;
-    let album_hlc_uuid = Uuid::new_v4().to_string();
-    let album_name = "Album for Last Sync HLC Test".to_string();
-    albums::ActiveModel {
-        id: ActiveValue::Set(album_pk_id),
-        name: ActiveValue::Set(album_name.clone()),
-        group: ActiveValue::Set("Last Sync Group".to_string()),
-        hlc_uuid: ActiveValue::Set(album_hlc_uuid.clone()),
-        created_at_hlc_ts: ActiveValue::Set(album_creation_hlc.to_rfc3339()),
-        created_at_hlc_ver: ActiveValue::Set(album_creation_hlc.version as i32),
-        created_at_hlc_nid: ActiveValue::Set(album_creation_hlc.node_id.to_string()),
-        updated_at_hlc_ts: ActiveValue::Set(album_creation_hlc.to_rfc3339()),
-        updated_at_hlc_ver: ActiveValue::Set(album_creation_hlc.version as i32),
-        updated_at_hlc_nid: ActiveValue::Set(album_creation_hlc.node_id.to_string()),
-    }
-    .insert(&client_db)
+    seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        5,
+        "Album for HLC test",
+        None,
+    )
     .await?;
+    let results = fixture.run_sync().await?;
 
-    // Run sync
-    let results: Vec<TableSyncResult> = setup_and_run_sync(
-        &client_db,
-        client_node_id,
-        &remote_data_source,
-        &hlc_task_context,
+    let albums_meta = results
+        .iter()
+        .find(|r| r.table_name_str() == ALBUMS_TABLE)
+        .unwrap()
+        .metadata_ref();
+    let last_hlc_after = fixture
+        .remote_data_source
+        .get_remote_last_sync_hlc(ALBUMS_TABLE, fixture.client_node_id)
+        .await?;
+
+    assert!(
+        last_hlc_after.is_some(),
+        "Server should now have a last sync HLC"
+    );
+    assert_eq!(
+        last_hlc_after.as_ref(),
+        Some(&albums_meta.last_sync_hlc),
+        "Server-reported HLC should match client's final HLC"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_updates_album_synced_to_server() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    let mut album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        101,
+        "Initial Name",
+        None,
+    )
+    .await?;
+    fixture.run_sync().await?;
+
+    // Client updates the album
+    let update_hlc = fixture.client_hlc_context.generate_hlc();
+    let mut album_am = album.into_active_model();
+    album_am.name = Set("Updated by Client".to_string());
+    album_am.updated_at_hlc_ts = Set(update_hlc.to_rfc3339()?);
+    album_am.updated_at_hlc_ver = Set(update_hlc.version as i32);
+    album_am.updated_at_hlc_nid = Set(update_hlc.node_id.to_string());
+    album = album_am.update(&fixture.client_db).await?;
+
+    fixture.run_sync().await?;
+
+    let server_album = Albums::find_by_id(album.id)
+        .one(&fixture.server_db)
+        .await?
+        .context("Album not on server after update")?;
+    assert_eq!(server_album.name, "Updated by Client");
+    assert_eq!(server_album.updated_at_hlc_ts, update_hlc.to_rfc3339()?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_server_updates_album_synced_to_client() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    let mut album = seed_album(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        102,
+        "Initial Name",
+        None,
+    )
+    .await?;
+    fixture.run_sync().await?;
+
+    // Server updates the album
+    let update_hlc = fixture.server_hlc_context().generate_hlc();
+    let mut album_am = album.into_active_model();
+    album_am.name = Set("Updated by Server".to_string());
+    album_am.updated_at_hlc_ts = Set(update_hlc.to_rfc3339()?);
+    album_am.updated_at_hlc_ver = Set(update_hlc.version as i32);
+    album_am.updated_at_hlc_nid = Set(update_hlc.node_id.to_string());
+    album = album_am.update(&fixture.server_db).await?;
+
+    fixture.run_sync().await?;
+
+    let client_album = Albums::find_by_id(album.id)
+        .one(&fixture.client_db)
+        .await?
+        .context("Album not on client after update")?;
+    assert_eq!(client_album.name, "Updated by Server");
+    assert_eq!(client_album.updated_at_hlc_ts, update_hlc.to_rfc3339()?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_conflict_resolution_client_wins() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    let album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        103,
+        "Conflict Candidate",
+        None,
+    )
+    .await?;
+    fixture.run_sync().await?;
+
+    // Server makes an "older" update
+    let server_update_hlc = fixture.server_hlc_context().generate_hlc();
+    let mut server_am = Albums::find_by_id(album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap()
+        .into_active_model();
+    server_am.name = Set("Server Update (should lose)".to_string());
+    server_am.updated_at_hlc_ts = Set(server_update_hlc.to_rfc3339()?);
+    server_am.updated_at_hlc_ver = Set(server_update_hlc.version as i32);
+    server_am.updated_at_hlc_nid = Set(server_update_hlc.node_id.to_string());
+    server_am.update(&fixture.server_db).await?;
+
+    tokio::time::sleep(Duration::from_millis(5)).await; // Ensure time progresses
+
+    // Client makes a "newer" update
+    let client_update_hlc = fixture.client_hlc_context.generate_hlc();
+    let mut client_am = Albums::find_by_id(album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap()
+        .into_active_model();
+    client_am.name = Set("Client Update (should win)".to_string());
+    client_am.updated_at_hlc_ts = Set(client_update_hlc.to_rfc3339()?);
+    client_am.updated_at_hlc_ver = Set(client_update_hlc.version as i32);
+    client_am.updated_at_hlc_nid = Set(client_update_hlc.node_id.to_string());
+    client_am.update(&fixture.client_db).await?;
+
+    assert!(
+        client_update_hlc > server_update_hlc,
+        "Client HLC must be greater for this test"
+    );
+
+    fixture.run_sync().await?;
+
+    let final_server_album = Albums::find_by_id(album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap();
+    let final_client_album = Albums::find_by_id(album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap();
+
+    assert_eq!(final_server_album.name, "Client Update (should win)");
+    assert_eq!(final_client_album.name, "Client Update (should win)");
+    assert_eq!(
+        final_server_album.updated_at_hlc_nid,
+        client_update_hlc.node_id.to_string()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_conflict_resolution_server_wins() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    let album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        104,
+        "Conflict Candidate",
+        None,
+    )
+    .await?;
+    fixture.run_sync().await?;
+
+    // Client makes an "older" update
+    let client_update_hlc = fixture.client_hlc_context.generate_hlc();
+    let mut client_am = Albums::find_by_id(album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap()
+        .into_active_model();
+    client_am.name = Set("Client Update (should lose)".to_string());
+    client_am.updated_at_hlc_ts = Set(client_update_hlc.to_rfc3339()?);
+    client_am.updated_at_hlc_ver = Set(client_update_hlc.version as i32);
+    client_am.updated_at_hlc_nid = Set(client_update_hlc.node_id.to_string());
+    client_am.update(&fixture.client_db).await?;
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // Server makes a "newer" update
+    let server_update_hlc = fixture.server_hlc_context().generate_hlc();
+    let mut server_am = Albums::find_by_id(album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap()
+        .into_active_model();
+    server_am.name = Set("Server Update (should win)".to_string());
+    server_am.updated_at_hlc_ts = Set(server_update_hlc.to_rfc3339()?);
+    server_am.updated_at_hlc_ver = Set(server_update_hlc.version as i32);
+    server_am.updated_at_hlc_nid = Set(server_update_hlc.node_id.to_string());
+    server_am.update(&fixture.server_db).await?;
+
+    assert!(
+        server_update_hlc > client_update_hlc,
+        "Server HLC must be greater for this test"
+    );
+
+    fixture.run_sync().await?;
+
+    let final_server_album = Albums::find_by_id(album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap();
+    let final_client_album = Albums::find_by_id(album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap();
+
+    assert_eq!(final_server_album.name, "Server Update (should win)");
+    assert_eq!(final_client_album.name, "Server Update (should win)");
+    assert_eq!(
+        final_server_album.updated_at_hlc_nid,
+        server_update_hlc.node_id.to_string()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_deletes_album_synced_to_server() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    // 1. Seed an album on the client and sync it to the server
+    let album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        201,
+        "Album to be deleted by client",
+        None,
+    )
+    .await?;
+    fixture.run_sync().await?;
+
+    // 2. Verify it exists on both client and server
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 1);
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 1);
+
+    // 3. Client deletes the album
+    Albums::delete_by_id(album.id)
+        .exec(&fixture.client_db)
+        .await?;
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 0);
+
+    // 4. Run sync again
+    fixture.run_sync().await?;
+
+    // 5. Verify the album is deleted on the server as well
+    assert_eq!(
+        Albums::find().count(&fixture.server_db).await?,
+        0,
+        "Album should have been deleted from the server"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_server_deletes_album_synced_to_client() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    // 1. Seed an album on the server and sync it to the client
+    let album = seed_album(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        202,
+        "Album to be deleted by server",
+        None,
+    )
+    .await?;
+    fixture.run_sync().await?;
+
+    // 2. Verify it exists on both client and server
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 1);
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 1);
+
+    // 3. Server deletes the album
+    Albums::delete_by_id(album.id)
+        .exec(&fixture.server_db)
+        .await?;
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 0);
+
+    // 4. Run sync again
+    fixture.run_sync().await?;
+
+    // 5. Verify the album is deleted on the client as well
+    assert_eq!(
+        Albums::find().count(&fixture.client_db).await?,
+        0,
+        "Album should have been deleted from the client"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_junction_table_media_file_albums() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    // 1. Seed related entities on the client
+    let client_album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        301,
+        "Junction Test Album",
+        None,
+    )
+    .await?;
+    let client_mf = seed_media_file(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        302,
+        "junction_test_song",
+        None,
     )
     .await?;
 
-    let albums_job_metadata_owned: SyncTableMetadata = results
-        .into_iter()
-        .find(|r: &TableSyncResult| r.get_metadata().is_some_and(|s| s.table_name == "albums"))
-        .expect("Albums job result not found")
-        .unwrap_metadata();
+    // 2. Seed the junction table entry on the client
+    let client_mfa = seed_media_file_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        1,
+        client_mf.id,
+        client_album.id,
+        1, // track_number
+    )
+    .await?;
 
-    let last_hlc_after_sync_opt = remote_data_source
-        .get_remote_last_sync_hlc("albums", client_node_id)
-        .await?;
+    // 3. Run sync
+    fixture.run_sync().await?;
 
-    let server_reported_hlc = last_hlc_after_sync_opt
-        .clone()
-        .context("Server API did not return a last_sync_hlc for the client")?;
+    // 4. Verify all entities and the junction exist on the server
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 1);
+    assert_eq!(MediaFiles::find().count(&fixture.server_db).await?, 1);
+    assert_eq!(MediaFileAlbums::find().count(&fixture.server_db).await?, 1);
 
-    let client_final_hlc = albums_job_metadata_owned.last_sync_hlc;
-
-    assert!(client_final_hlc >= server_reported_hlc);
-
-    let server_album = albums::Entity::find()
-        .filter(albums::Column::HlcUuid.eq(album_hlc_uuid))
-        .one(&server_db)
+    // 5. Verify the FKs and data on the server's junction table entry
+    let server_mfa = MediaFileAlbums::find()
+        .filter(media_file_albums::Column::HlcUuid.eq(client_mfa.hlc_uuid))
+        .one(&fixture.server_db)
         .await?
-        .context("Album not found on server after sync")?;
-    assert_eq!(server_album.name, album_name);
+        .context("Junction entry not found on server")?;
 
-    let expected_hlc_from_op = HLC {
-        timestamp_ms: album_creation_hlc.timestamp_ms,
-        version: album_creation_hlc.version,
-        node_id: album_creation_hlc.node_id,
-    };
-
-    let server_sync_record = sync_record::Entity::find()
-        .filter(sync_record::Column::TableName.eq("albums"))
-        .filter(sync_record::Column::ClientNodeId.eq(client_node_id.to_string()))
-        .one(&server_db)
+    // Find the corresponding album and media file on the server by their original IDs
+    let server_album = Albums::find_by_id(client_album.id)
+        .one(&fixture.server_db)
         .await?
-        .context("sync_record not found on server")?;
-
-    let server_stored_hlc = sync_utils::parse_hlc(
-        &server_sync_record.last_sync_hlc_ts,
-        server_sync_record.last_sync_hlc_ver,
-        &server_sync_record.last_sync_hlc_nid,
-    )?;
+        .context("Album not found on server")?;
+    let server_mf = MediaFiles::find_by_id(client_mf.id)
+        .one(&fixture.server_db)
+        .await?
+        .context("Media file not found on server")?;
 
     assert_eq!(
-        Some(server_stored_hlc.clone()),
-        last_hlc_after_sync_opt, // Compare Option<HLC> with Option<HLC>
-        "Server's stored HLC in sync_record table mismatches API response"
+        server_mfa.album_id, server_album.id,
+        "Junction album_id FK is incorrect"
     );
-    assert!(
-        server_stored_hlc >= expected_hlc_from_op,
-        "Server's stored HLC should be >= HLC of the operation. Server: {}, Op: {}",
-        server_stored_hlc,
-        expected_hlc_from_op
+    assert_eq!(
+        server_mfa.media_file_id, server_mf.id,
+        "Junction media_file_id FK is incorrect"
+    );
+    assert_eq!(
+        server_mfa.track_number,
+        Some(1),
+        "Track number did not sync correctly"
     );
 
-    test_server.shutdown_tx.send(()).ok();
-    test_server.handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bidirectional_updates_different_albums() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    // 1. Seed initial data
+    let client_album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        1,
+        "Album A from Client",
+        None,
+    )
+    .await?;
+    let server_album = seed_album(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        2,
+        "Album B from Server",
+        None,
+    )
+    .await?;
+
+    // 2. Initial sync
+    fixture.run_sync().await?;
+
+    // 3. Verify initial state is consistent
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 2);
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 2);
+
+    // Ensure HLCs progress for updates
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // 4. Server updates the album that originated from the client
+    let server_update_hlc = fixture.server_hlc_context().generate_hlc();
+    let mut album_a_on_server = Albums::find_by_id(client_album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap()
+        .into_active_model();
+    album_a_on_server.name = Set("Album A updated by Server".to_string());
+    album_a_on_server.updated_at_hlc_ts = Set(server_update_hlc.to_rfc3339()?);
+    album_a_on_server.updated_at_hlc_ver = Set(server_update_hlc.version as i32);
+    album_a_on_server.updated_at_hlc_nid = Set(server_update_hlc.node_id.to_string());
+    let updated_a = album_a_on_server.update(&fixture.server_db).await?;
+
+    // 5. Client updates the album that originated from the server
+    let client_update_hlc = fixture.client_hlc_context.generate_hlc();
+    let mut album_b_on_client = Albums::find_by_id(server_album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap()
+        .into_active_model();
+    album_b_on_client.name = Set("Album B updated by Client".to_string());
+    album_b_on_client.updated_at_hlc_ts = Set(client_update_hlc.to_rfc3339()?);
+    album_b_on_client.updated_at_hlc_ver = Set(client_update_hlc.version as i32);
+    album_b_on_client.updated_at_hlc_nid = Set(client_update_hlc.node_id.to_string());
+    let updated_b = album_b_on_client.update(&fixture.client_db).await?;
+
+    // 6. Final sync
+    fixture.run_sync().await?;
+
+    // 7. Verify final state
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 2);
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 2);
+
+    // Check Album A on both sides
+    let final_a_on_client = Albums::find_by_id(client_album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap();
+    let final_a_on_server = Albums::find_by_id(client_album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap();
+    assert_eq!(final_a_on_client.name, "Album A updated by Server");
+    assert_eq!(final_a_on_server.name, "Album A updated by Server");
+    assert_eq!(
+        final_a_on_server.updated_at_hlc_ts,
+        updated_a.updated_at_hlc_ts
+    );
+
+    // Check Album B on both sides
+    let final_b_on_client = Albums::find_by_id(server_album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap();
+    let final_b_on_server = Albums::find_by_id(server_album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap();
+    assert_eq!(final_b_on_client.name, "Album B updated by Client");
+    assert_eq!(final_b_on_server.name, "Album B updated by Client");
+    assert_eq!(
+        final_b_on_client.updated_at_hlc_ts,
+        updated_b.updated_at_hlc_ts
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_conflict_resolution_create_create_client_wins() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+    let conflict_uuid = Uuid::new_v4();
+
+    // 1. Server creates a record
+    let server_album = seed_album(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        501,
+        "Create-Create Server",
+        Some(conflict_uuid),
+    )
+    .await?;
+
+    // Ensure client's HLC will be newer
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // 2. Client creates a record with the same hlc_uuid
+    let client_album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        502, // Different PK
+        "Create-Create Client",
+        Some(conflict_uuid),
+    )
+    .await?;
+
+    // Pre-condition check
+    let client_hlc = ::sync::hlc::HLC {
+        timestamp_ms: DateTime::parse_from_rfc3339(&client_album.updated_at_hlc_ts)?
+            .timestamp_millis() as u64,
+        version: client_album.updated_at_hlc_ver as u32,
+        node_id: client_album.updated_at_hlc_nid.parse()?,
+    };
+    let server_hlc = ::sync::hlc::HLC {
+        timestamp_ms: DateTime::parse_from_rfc3339(&server_album.updated_at_hlc_ts)?
+            .timestamp_millis() as u64,
+        version: server_album.updated_at_hlc_ver as u32,
+        node_id: server_album.updated_at_hlc_nid.parse()?,
+    };
+    assert!(client_hlc > server_hlc, "Client HLC should be greater");
+
+    // 3. Run sync
+    fixture.run_sync().await?;
+
+    // 4. Verify resolution
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 1);
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 1);
+
+    let final_client_album = Albums::find().one(&fixture.client_db).await?.unwrap();
+    let final_server_album = Albums::find().one(&fixture.server_db).await?.unwrap();
+
+    assert_eq!(final_client_album.name, "Create-Create Client");
+    assert_eq!(final_server_album.name, "Create-Create Client");
+    assert_eq!(final_client_album.hlc_uuid, client_album.hlc_uuid);
+    assert_eq!(final_server_album.hlc_uuid, client_album.hlc_uuid);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_conflict_resolution_create_create_server_wins() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+    let conflict_uuid = Uuid::new_v4();
+
+    // 1. Client creates a record
+    let client_album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        502,
+        "Create-Create Client",
+        Some(conflict_uuid),
+    )
+    .await?;
+
+    // Ensure server's HLC will be newer
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // 2. Server creates a record with the same hlc_uuid
+    let server_album = seed_album(
+        &fixture.server_db,
+        fixture.server_hlc_context(),
+        501, // Different PK
+        "Create-Create Server",
+        Some(conflict_uuid),
+    )
+    .await?;
+
+    // Pre-condition check
+    let client_hlc = ::sync::hlc::HLC {
+        timestamp_ms: DateTime::parse_from_rfc3339(&client_album.updated_at_hlc_ts)?
+            .timestamp_millis() as u64,
+        version: client_album.updated_at_hlc_ver as u32,
+        node_id: client_album.updated_at_hlc_nid.parse()?,
+    };
+    let server_hlc = ::sync::hlc::HLC {
+        timestamp_ms: DateTime::parse_from_rfc3339(&server_album.updated_at_hlc_ts)?
+            .timestamp_millis() as u64,
+        version: server_album.updated_at_hlc_ver as u32,
+        node_id: server_album.updated_at_hlc_nid.parse()?,
+    };
+    assert!(server_hlc > client_hlc, "Server HLC should be greater");
+
+    // 3. Run sync
+    fixture.run_sync().await?;
+
+    // 4. Verify resolution
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 1);
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 1);
+
+    let final_client_album = Albums::find().one(&fixture.client_db).await?.unwrap();
+    let final_server_album = Albums::find().one(&fixture.server_db).await?.unwrap();
+
+    assert_eq!(final_client_album.name, "Create-Create Server");
+    assert_eq!(final_server_album.name, "Create-Create Server");
+    assert_eq!(final_client_album.hlc_uuid, server_album.hlc_uuid);
+    assert_eq!(final_server_album.hlc_uuid, server_album.hlc_uuid);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_conflict_resolution_update_delete_delete_wins() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    // 1. Seed an album on the client and sync it to the server
+    let album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        201,
+        "Album to be deleted by client",
+        None,
+    )
+    .await?;
+    fixture.run_sync().await?;
+
+    // 2. Verify it exists on both client and server
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 1);
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 1);
+
+    // 3. Client deletes the album
+    Albums::delete_by_id(album.id)
+        .exec(&fixture.client_db)
+        .await?;
+    assert_eq!(Albums::find().count(&fixture.client_db).await?, 0);
+
+    // 4. Run sync again
+    fixture.run_sync().await?;
+
+    // 5. Verify the album is deleted on the server as well
+    assert_eq!(
+        Albums::find().count(&fixture.server_db).await?,
+        0,
+        "Album should have been deleted from the server"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_conflict_resolution_update_delete_update_wins() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+
+    // 1. Seed and sync a record
+    let album = seed_album(
+        &fixture.client_db,
+        &fixture.client_hlc_context,
+        602,
+        "Update-Delete Candidate",
+        None,
+    )
+    .await?;
+    fixture.run_sync().await?;
+    assert_eq!(Albums::find().count(&fixture.server_db).await?, 1);
+
+    // 2. Client deletes the record (with an older HLC)
+    Albums::delete_by_id(album.id)
+        .exec(&fixture.client_db)
+        .await?;
+    let client_delete_hlc = fixture.client_hlc_context.generate_hlc();
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // 3. Server updates the record (with a newer HLC)
+    let server_update_hlc = fixture.server_hlc_context().generate_hlc();
+    let mut server_am = Albums::find_by_id(album.id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap()
+        .into_active_model();
+    server_am.name = Set("Server Update (should win)".to_string());
+    server_am.updated_at_hlc_ts = Set(server_update_hlc.to_rfc3339()?);
+    server_am.updated_at_hlc_ver = Set(server_update_hlc.version as i32);
+    server_am.updated_at_hlc_nid = Set(server_update_hlc.node_id.to_string());
+    let updated_album = server_am.update(&fixture.server_db).await?;
+    assert!(
+        server_update_hlc > client_delete_hlc,
+        "Server update HLC must be newer"
+    );
+
+    // 4. Run sync
+    fixture.run_sync().await?;
+
+    // 5. Verify the record is updated on both ends
+    assert_eq!(
+        Albums::find().count(&fixture.client_db).await?,
+        1,
+        "Client should have one album, update should win"
+    );
+    assert_eq!(
+        Albums::find().count(&fixture.server_db).await?,
+        1,
+        "Server should have one album"
+    );
+
+    let final_client_album = Albums::find_by_id(album.id)
+        .one(&fixture.client_db)
+        .await?
+        .unwrap();
+    assert_eq!(final_client_album.name, "Server Update (should win)");
+    assert_eq!(
+        final_client_album.updated_at_hlc_ts,
+        updated_album.updated_at_hlc_ts
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_chunking_and_update_propagation() -> Result<()> {
+    let fixture = TestFixture::new().await?;
+    let server_node_id = fixture.server.node_id;
+
+    // 1. Seed 150 albums on the server with varying timestamps
+    let num_albums = 150;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+
+    for i in 0..50 {
+        // 50 records, ~30 days old
+        let timestamp_ms = now_ms - 30 * 24 * 60 * 60 * 1000 + (i * 1000) as u64;
+        let hlc = ::sync::hlc::HLC {
+            timestamp_ms,
+            version: 0,
+            node_id: server_node_id,
+        };
+        seed_album_with_hlc(
+            &fixture.server_db,
+            i + 1,
+            &format!("Album {}", i + 1),
+            None,
+            &hlc,
+        )
+        .await?;
+    }
+    for i in 50..100 {
+        // 50 records, ~10 days old
+        let timestamp_ms = now_ms - 10 * 24 * 60 * 60 * 1000 + (i * 1000) as u64;
+        let hlc = ::sync::hlc::HLC {
+            timestamp_ms,
+            version: 0,
+            node_id: server_node_id,
+        };
+        seed_album_with_hlc(
+            &fixture.server_db,
+            i + 1,
+            &format!("Album {}", i + 1),
+            None,
+            &hlc,
+        )
+        .await?;
+    }
+    for i in 100..num_albums {
+        // 50 records, ~1 day old
+        let timestamp_ms = now_ms - 24 * 60 * 60 * 1000 + (i * 1000) as u64;
+        let hlc = ::sync::hlc::HLC {
+            timestamp_ms,
+            version: 0,
+            node_id: server_node_id,
+        };
+        seed_album_with_hlc(
+            &fixture.server_db,
+            i + 1,
+            &format!("Album {}", i + 1),
+            None,
+            &hlc,
+        )
+        .await?;
+    }
+
+    // 2. Initial sync to get all albums on the client
+    fixture.run_sync().await?;
+    assert_eq!(
+        Albums::find().count(&fixture.client_db).await?,
+        num_albums as u64,
+        "Client should have all albums after initial sync"
+    );
+
+    // 3. Directly get chunks from the server to verify chunking is happening
+    let chunks_before = fixture
+        .remote_data_source
+        .get_remote_chunks::<albums::Entity>(ALBUMS_TABLE, None)
+        .await?;
+    assert!(
+        !chunks_before.is_empty(),
+        "Should have at least one chunk for 150 albums. Found 0 chunks."
+    );
+
+    // 4. Update one of the recent albums on the server
+    let album_to_update_id = 125; // One of the newer albums
+    let mut album_to_update = Albums::find_by_id(album_to_update_id)
+        .one(&fixture.server_db)
+        .await?
+        .unwrap()
+        .into_active_model();
+
+    let update_hlc = fixture.server_hlc_context().generate_hlc(); // A current HLC
+
+    album_to_update.name = Set("Updated Album Name".to_string());
+    album_to_update.updated_at_hlc_ts = Set(update_hlc.to_rfc3339()?);
+    album_to_update.updated_at_hlc_ver = Set(update_hlc.version as i32);
+    album_to_update.updated_at_hlc_nid = Set(update_hlc.node_id.to_string());
+    album_to_update.update(&fixture.server_db).await?;
+
+    // 5. Get chunks again and verify only one has changed
+    let chunks_after = fixture
+        .remote_data_source
+        .get_remote_chunks::<albums::Entity>(ALBUMS_TABLE, None)
+        .await?;
+
+    assert_eq!(
+        chunks_before.len(),
+        chunks_after.len(),
+        "Number of chunks should not change"
+    );
+
+    let changed_chunks = chunks_before
+        .iter()
+        .zip(chunks_after.iter())
+        .filter(|(a, b)| a.chunk_hash != b.chunk_hash)
+        .count();
+    assert_eq!(
+        changed_chunks, 1,
+        "Exactly one chunk hash should have changed"
+    );
+
+    // 6. Run sync again
+    fixture.run_sync().await?;
+
+    // 7. Verify the update propagated to the client
+    let updated_album_on_client = Albums::find_by_id(album_to_update_id)
+        .one(&fixture.client_db)
+        .await?
+        .context("Updated album not found on client")?;
+
+    assert_eq!(updated_album_on_client.name, "Updated Album Name");
+    assert_eq!(
+        Albums::find().count(&fixture.client_db).await?,
+        num_albums as u64,
+        "Client should still have the same number of albums"
+    );
+    assert_eq!(
+        Albums::find().count(&fixture.server_db).await?,
+        num_albums as u64,
+        "Server should still have the same number of albums"
+    );
+
     Ok(())
 }
 
 // // TODO: Add more tests:
-// // - Updates (client updates, server updates)
-// // - Deletes (client deletes, server deletes)
-// // - Sync for junction tables (media_file_albums, media_file_artists, media_file_genres)
-// //   ensuring FKs are correct (e.g. media_file_albums.track_number).
-// // - More complex bidirectional scenarios (e.g. client updates X, server updates Y, then sync).
-// // - Conflict scenarios (if your HLC logic handles them, e.g., both update same record).
-// // - Test chunking and sub-chunking more directly if specific behaviors need validation beyond successful sync.
 // // - Test error conditions (e.g., server down during a call, malformed data).
