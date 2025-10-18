@@ -1311,7 +1311,7 @@
   "@deduplicate": {
     "description": "Button label for removing duplicate tracks from a music library or playlist. Refers to the function of identifying and removing duplicate songs. Alternative phrasings could include 'Remove Duplicates' or 'Clean Duplicates' depending on what's most natural in the target language."
   },
-  "deduplicateThresholdTitle": "重複除外の閾値 Threshold",
+  "deduplicateThresholdTitle": "重複除外の閾値",
   "@deduplicateThresholdTitle": {
     "description": "Title for the audio similarity threshold setting. Indicates where users can adjust how strictly audio tracks are compared for duplication detection."
   },
